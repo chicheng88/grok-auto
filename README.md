@@ -27,7 +27,6 @@ Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Cas
 ├── setup_solver.py             # 安装 Solver / camoufox 依赖
 ├── TurnstileSolver.bat         # Windows 一键启动 Solver
 ├── import_batch_once.py        # 从 keys 文本批量导入 sub2api
-├── standalone_same_session_n.py # 同会话批跑脚本（本地/池代理）
 ├── browser_configs.py
 ├── db_results.py
 ├── templates/index.html        # 控制台前端

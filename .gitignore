@@ -45,4 +45,6 @@ proxies/
 _align_backup_*/
 _recall_old_sso.py
 _tmp_*.py
+# 同会话批跑 CLI（仅本地，不进仓库）
+standalone_same_session_n.py
 
