@@ -97,8 +97,10 @@ def resolve_register_mode(raw: Optional[str] = None) -> str:
     return _REGISTER_MODE_DEFAULT
 
 
-# same_session 指纹地区（locale/timezone；代理默认本机）
-# 多区 + 双 OS，配合 camoufox 池限次/冷启，压 Castle $registration 连号 deny
+# same_session 指纹地区（locale/timezone）
+# 关键规则（对齐 F:\tool\grokzhuce standalone）：
+#   先探当前代理出口 IP/国家 → 指纹只在同国家簇内轮 OS/次要 tag
+#   禁止 HK 出口配 JP locale / US IP 配 AU 时区（IP↔locale 错配会抬 MARKED）
 _SS_FP_REGIONS = [
     {"tag": "US-W", "locale": "en-US", "timezone": "America/Los_Angeles", "fp_os": "windows"},
     {"tag": "US-E", "locale": "en-US", "timezone": "America/New_York", "fp_os": "windows"},
@@ -136,6 +138,58 @@ _SS_FP_REGIONS = [
     {"tag": "MX", "locale": "es-MX", "timezone": "America/Mexico_City", "fp_os": "macos"},
 ]
 _SS_FP_OS_POOL = ("windows", "macos")
+
+# ISO / 时区 → 国家簇（出口对齐用；与 standalone_same_session_n 同源）
+_SS_CC_FAMILY: dict[str, str] = {
+    "JP": "jp", "AU": "au", "US": "us", "KR": "kr", "SG": "sg",
+    "TW": "tw", "MY": "my", "HK": "hk", "GB": "gb", "UK": "gb",
+    "CA": "ca", "DE": "de", "FR": "fr", "NL": "nl", "IE": "ie",
+    "ES": "es", "IT": "it", "SE": "se", "PL": "pl", "CH": "ch",
+    "IN": "in", "NZ": "nz", "BR": "br", "MX": "mx",
+}
+_SS_TZ_FAMILY: dict[str, str] = {
+    "asia/tokyo": "jp", "asia/osaka": "jp",
+    "australia/sydney": "au", "australia/melbourne": "au", "australia/perth": "au",
+    "america/los_angeles": "us", "america/new_york": "us", "america/chicago": "us",
+    "america/denver": "us", "america/phoenix": "us",
+    "america/toronto": "ca", "america/vancouver": "ca",
+    "asia/seoul": "kr", "asia/singapore": "sg", "asia/taipei": "tw",
+    "asia/kuala_lumpur": "my", "asia/hong_kong": "hk", "asia/kolkata": "in",
+    "europe/london": "gb", "europe/dublin": "ie", "europe/berlin": "de",
+    "europe/paris": "fr", "europe/amsterdam": "nl", "europe/madrid": "es",
+    "europe/rome": "it", "europe/stockholm": "se", "europe/warsaw": "pl",
+    "europe/zurich": "ch", "pacific/auckland": "nz",
+    "america/sao_paulo": "br", "america/mexico_city": "mx",
+}
+_SS_FAMILY_DEFAULTS: dict[str, dict[str, str]] = {
+    "jp": {"tag": "JP-LOCAL", "locale": "ja-JP", "timezone": "Asia/Tokyo"},
+    "au": {"tag": "AU-LOCAL", "locale": "en-AU", "timezone": "Australia/Sydney"},
+    "us": {"tag": "US-LOCAL", "locale": "en-US", "timezone": "America/Los_Angeles"},
+    "kr": {"tag": "KR-LOCAL", "locale": "ko-KR", "timezone": "Asia/Seoul"},
+    "sg": {"tag": "SG-LOCAL", "locale": "en-SG", "timezone": "Asia/Singapore"},
+    "tw": {"tag": "TW-LOCAL", "locale": "zh-TW", "timezone": "Asia/Taipei"},
+    "my": {"tag": "MY-LOCAL", "locale": "en-MY", "timezone": "Asia/Kuala_Lumpur"},
+    "hk": {"tag": "HK-LOCAL", "locale": "zh-HK", "timezone": "Asia/Hong_Kong"},
+    "gb": {"tag": "GB-LOCAL", "locale": "en-GB", "timezone": "Europe/London"},
+    "ca": {"tag": "CA-LOCAL", "locale": "en-CA", "timezone": "America/Toronto"},
+    "de": {"tag": "DE-LOCAL", "locale": "de-DE", "timezone": "Europe/Berlin"},
+    "fr": {"tag": "FR-LOCAL", "locale": "fr-FR", "timezone": "Europe/Paris"},
+    "nl": {"tag": "NL-LOCAL", "locale": "nl-NL", "timezone": "Europe/Amsterdam"},
+    "ie": {"tag": "IE-LOCAL", "locale": "en-IE", "timezone": "Europe/Dublin"},
+    "es": {"tag": "ES-LOCAL", "locale": "es-ES", "timezone": "Europe/Madrid"},
+    "it": {"tag": "IT-LOCAL", "locale": "it-IT", "timezone": "Europe/Rome"},
+    "se": {"tag": "SE-LOCAL", "locale": "sv-SE", "timezone": "Europe/Stockholm"},
+    "pl": {"tag": "PL-LOCAL", "locale": "pl-PL", "timezone": "Europe/Warsaw"},
+    "ch": {"tag": "CH-LOCAL", "locale": "de-CH", "timezone": "Europe/Zurich"},
+    "in": {"tag": "IN-LOCAL", "locale": "en-IN", "timezone": "Asia/Kolkata"},
+    "nz": {"tag": "NZ-LOCAL", "locale": "en-NZ", "timezone": "Pacific/Auckland"},
+    "br": {"tag": "BR-LOCAL", "locale": "pt-BR", "timezone": "America/Sao_Paulo"},
+    "mx": {"tag": "MX-LOCAL", "locale": "es-MX", "timezone": "America/Mexico_City"},
+}
+# 按代理 spec 缓存出口探测（切代理后各自独立）
+_SS_EGRESS_LOCK = threading.Lock()
+_SS_EGRESS_BY_PROXY: dict[str, dict[str, Any]] = {}
+_SS_EGRESS_PROBE_COUNT: dict[str, int] = {}  # 每代理探测次数，配合 EVERY
 _SS_VIEWPORT_BASES = (
     (1280, 720),
     (1280, 800),
@@ -160,17 +214,113 @@ _SS_RECENT_FP_LOCK = threading.Lock()
 _SS_RECENT_FP_SIGS: deque = deque(maxlen=48)
 
 
+def _ss_split_proxy_lines(raw: str) -> list[str]:
+    """代理池拆行：换行/逗号/分号；去 # 注释与空行，去重保序。"""
+    text = (raw or "").replace("\r\n", "\n").replace("\r", "\n")
+    parts: list[str] = []
+    for chunk in re.split(r"[\n,;]+", text):
+        line = (chunk or "").strip()
+        if not line or line.startswith("#"):
+            continue
+        parts.append(line)
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in parts:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def _ss_load_proxy_pool() -> list[str]:
+    """
+    加载代理池。优先级：
+      1) GROK_PROXY_LIST（多行/分号）
+      2) GROK_PROXY / XAI_PROXY / SAME_SESSION_PROXY / GROK_SAME_SESSION_PROXY
+      3) STANDALONE_LOCAL_PROXY / LOCAL_PROXY
+      4) 空列表 = 直连（不再默认塞 127.0.0.1:7897，避免误绑）
+    """
+    pool = _ss_split_proxy_lines(os.environ.get("GROK_PROXY_LIST") or "")
+    if pool:
+        return pool
+    for key in (
+        "GROK_PROXY",
+        "XAI_PROXY",
+        "SAME_SESSION_PROXY",
+        "GROK_SAME_SESSION_PROXY",
+        "STANDALONE_LOCAL_PROXY",
+        "LOCAL_PROXY",
+    ):
+        raw = (os.environ.get(key) or "").strip()
+        if raw:
+            one = _ss_split_proxy_lines(raw)
+            if one:
+                return one
+            return [raw]
+    return []
+
+
 def _ss_local_proxy_spec() -> str:
-    """同会话默认本机代理：STANDALONE_LOCAL_PROXY / LOCAL_PROXY / 127.0.0.1:7897。"""
+    """同会话当前代理：池首条；无池则空（直连）。"""
+    pool = _ss_load_proxy_pool()
+    if pool:
+        return pool[0]
+    return ""
+
+
+def _ss_mask_proxy(spec: str) -> str:
+    """日志脱敏：藏密码。"""
+    s = (spec or "").strip()
+    if not s:
+        return "(direct)"
+    try:
+        if "@" in s:
+            return s.split("@", 1)[-1]
+        parts = s.split(":")
+        if len(parts) >= 4 and parts[1].isdigit():
+            return f"{parts[0]}:{parts[1]}:***"
+        if "://" in s and "@" in s:
+            return s.split("@", 1)[-1]
+    except Exception:
+        pass
+    return s if len(s) <= 64 else (s[:28] + "…" + s[-12:])
+
+
+def _ss_proxy_switch_limit() -> int:
+    """
+    deny 后连续切换代理次数上限；触顶进入冷却。
+    GROK_SS_PROXY_SWITCH_LIMIT / STANDALONE_PROXY_SWITCH；默认 3；0=不切代理只停。
+    """
     raw = (
-        os.environ.get("STANDALONE_LOCAL_PROXY")
-        or os.environ.get("LOCAL_PROXY")
-        or os.environ.get("GROK_SAME_SESSION_PROXY")
-        or "127.0.0.1:7897"
-    ).strip()
-    if not raw:
-        return "127.0.0.1:7897"
-    return raw
+        os.environ.get("GROK_SS_PROXY_SWITCH_LIMIT")
+        or os.environ.get("STANDALONE_PROXY_SWITCH")
+        or "3"
+    ).strip().lower()
+    if raw in ("0", "off", "false", "no", "none"):
+        return 0
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return 3
+
+
+def _ss_cooldown_sec() -> float:
+    """
+    连续切代理仍 deny 后的冷却秒数。
+    GROK_SS_COOLDOWN_SEC / STANDALONE_COOLDOWN_SEC；默认 60；0=不冷却直接继续（仍会重置切换计数）。
+    """
+    raw = (
+        os.environ.get("GROK_SS_COOLDOWN_SEC")
+        or os.environ.get("STANDALONE_COOLDOWN_SEC")
+        or "60"
+    ).strip().lower()
+    if raw in ("off", "false", "no", "none"):
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except Exception:
+        return 60.0
 
 
 def _ss_fp_sig(fp: dict[str, Any]) -> str:
@@ -186,13 +336,377 @@ def _ss_fp_sig(fp: dict[str, Any]) -> str:
     )
 
 
-def _ss_pick_fp(idx: int = 0) -> dict[str, Any]:
+def _ss_region_family(tag_or_text: str) -> str:
+    """粗分国家簇，避免 JP 出口配 AU locale（IP/时区错配）。"""
+    b = (tag_or_text or "").lower().replace("_", " ").replace("-", " ")
+    checks = (
+        ("jp", ("jp", "tokyo", "osaka", "japan")),
+        ("au", ("au", "sydney", "melbourne", "perth", "australia")),
+        ("us", (" us", "united states", "los angeles", "new york", "america/", "chicago", "denver", "phoenix")),
+        ("kr", ("kr", "seoul", "korea")),
+        ("sg", ("sg", "singapore")),
+        ("tw", ("tw", "taipei", "taiwan")),
+        ("my", ("my", "kuala", "malaysia")),
+        ("hk", ("hk", "hong kong", "hongkong")),
+        ("gb", ("gb", "london", "uk", "britain")),
+        ("ca", ("ca", "toronto", "vancouver", "canada")),
+        ("de", ("de", "berlin", "germany")),
+        ("fr", ("fr", "paris", "france")),
+        ("nl", ("nl", "amsterdam", "netherlands")),
+        ("ie", ("ie", "dublin", "ireland")),
+        ("es", ("es", "madrid", "spain")),
+        ("it", ("it", "rome", "italy")),
+        ("se", ("se", "stockholm", "sweden")),
+        ("pl", ("pl", "warsaw", "poland")),
+        ("ch", ("ch", "zurich", "switzerland")),
+        ("in", ("in", "kolkata", "india", "mumbai")),
+        ("nz", ("nz", "auckland", "zealand")),
+        ("br", ("br", "sao paulo", "brazil")),
+        ("mx", ("mx", "mexico")),
+    )
+    padded = f" {b} "
+    # us 特判：开头 us / 单词 us
+    if b.startswith("us") or " us " in padded or "united states" in b:
+        return "us"
+    for fam, keys in checks:
+        if fam == "us":
+            continue
+        for k in keys:
+            if k in b:
+                return fam
+    return ""
+
+
+def _ss_family_from_egress(cc: str = "", tz: str = "", city: str = "") -> str:
+    cc_u = (cc or "").strip().upper()
+    if cc_u in _SS_CC_FAMILY:
+        return _SS_CC_FAMILY[cc_u]
+    tz_l = (tz or "").strip().lower()
+    if tz_l in _SS_TZ_FAMILY:
+        return _SS_TZ_FAMILY[tz_l]
+    return _ss_region_family(f"{cc} {tz} {city}")
+
+
+def _ss_proxy_hint_family(proxy_spec: str) -> str:
     """
-    打散指纹：地区/时区/OS/分辨率/时序轮转+抖动+近期去重，
-    压同 worker 连号撞同一 camoufox 出口画像（Castle $registration deny 簇）。
+    从代理字符串猜国家簇（1024proxy region-XX / 用户名含 JP 等）。
+    探测失败时的软兜底，不能替代真实出口探测。
     """
-    n = len(_SS_FP_REGIONS)
-    jump_p = 0.55  # 默认更爱跳区
+    s = (proxy_spec or "").strip()
+    if not s:
+        return ""
+    # region-US / region-JP 常见于 1024proxy user
+    m = re.search(r"region[-_]?([A-Za-z]{2})", s, re.I)
+    if m:
+        return _ss_family_from_egress(m.group(1).upper(), "", "")
+    return _ss_region_family(s)
+
+
+def _ss_fp_pool_for_family(
+    fam: str, egress: Optional[dict[str, Any]] = None
+) -> list[dict[str, Any]]:
+    """同国家簇指纹池；无匹配则用探测 tz/locale 合成 win+mac 两条。"""
+    fam = (fam or "").strip().lower()
+    if fam:
+        same = [
+            fr
+            for fr in _SS_FP_REGIONS
+            if _ss_region_family(
+                f"{fr.get('tag') or ''} {fr.get('timezone') or ''} {fr.get('locale') or ''}"
+            )
+            == fam
+        ]
+        if same:
+            return list(same)
+    eg = egress or {}
+    base = dict(_SS_FAMILY_DEFAULTS.get(fam) or {})
+    tz = (eg.get("timezone") or base.get("timezone") or "America/Los_Angeles").strip()
+    loc = (base.get("locale") or "en-US").strip()
+    tag = base.get("tag") or f"EG-{(eg.get('cc') or 'XX')}"
+    if not fam and eg.get("timezone"):
+        fam2 = _ss_family_from_egress(
+            str(eg.get("cc") or ""), str(eg.get("timezone") or ""), ""
+        )
+        if fam2 and fam2 in _SS_FAMILY_DEFAULTS:
+            loc = _SS_FAMILY_DEFAULTS[fam2]["locale"]
+            tag = _SS_FAMILY_DEFAULTS[fam2]["tag"]
+            if not eg.get("timezone"):
+                tz = _SS_FAMILY_DEFAULTS[fam2]["timezone"]
+    return [
+        {"tag": tag, "locale": loc, "timezone": tz, "fp_os": "windows"},
+        {"tag": f"{tag}-MAC", "locale": loc, "timezone": tz, "fp_os": "macos"},
+    ]
+
+
+def _ss_detect_egress(
+    proxy_spec: str = "",
+    *,
+    force: bool = False,
+    log_fn: Optional[Callable[[str, str], None]] = None,
+) -> dict[str, Any]:
+    """
+    经当前注册代理探测真实出口 IP/国家/时区。
+    批内按 proxy_spec 缓存；切代理后各自独立。
+    覆盖：STANDALONE_EGRESS_CC / TZ / IP 可手填跳过探测。
+    """
+    key = (proxy_spec or "").strip() or "(direct)"
+    with _SS_EGRESS_LOCK:
+        cached = _SS_EGRESS_BY_PROXY.get(key)
+        if cached is not None and not force:
+            return dict(cached)
+
+    env_cc = (os.environ.get("STANDALONE_EGRESS_CC") or os.environ.get("GROK_SS_EGRESS_CC") or "").strip().upper()
+    env_tz = (os.environ.get("STANDALONE_EGRESS_TZ") or os.environ.get("GROK_SS_EGRESS_TZ") or "").strip()
+    env_ip = (os.environ.get("STANDALONE_EGRESS_IP") or os.environ.get("GROK_SS_EGRESS_IP") or "").strip()
+    if env_cc or env_tz:
+        fam = _ss_family_from_egress(env_cc, env_tz, "")
+        info: dict[str, Any] = {
+            "ok": True,
+            "source": "env",
+            "ip": env_ip or "?",
+            "cc": env_cc,
+            "country": env_cc,
+            "city": "",
+            "timezone": env_tz
+            or (_SS_FAMILY_DEFAULTS.get(fam) or {}).get("timezone", ""),
+            "family": fam,
+            "proxy": key,
+        }
+        with _SS_EGRESS_LOCK:
+            _SS_EGRESS_BY_PROXY[key] = dict(info)
+        return info
+
+    info = {
+        "ok": False,
+        "source": "",
+        "ip": "",
+        "cc": "",
+        "country": "",
+        "city": "",
+        "timezone": "",
+        "family": "",
+        "proxy": key,
+        "error": "",
+    }
+    proxies = None
+    raw = (proxy_spec or "").strip()
+    if raw:
+        try:
+            parsed = parse_proxy_spec(raw) or {}
+            url = (parsed.get("server_url") or parsed.get("server") or "").strip()
+            if url:
+                proxies = {"http": url, "https": url}
+        except Exception as e:
+            info["error"] = f"parse:{e}"[:80]
+
+    try:
+        from curl_cffi import requests as creq
+
+        # 复用 app 侧多源探测（mayips → ip-api → cf）
+        try:
+            from app import _probe_egress_via_proxy
+
+            eg = _probe_egress_via_proxy(creq, proxies=proxies, timeout=8.0)
+        except Exception:
+            # 轻量自备：ip-api
+            eg = {"ok": False, "error": "probe_import_fail"}
+            try:
+                r = creq.get(
+                    "http://ip-api.com/json/?fields=status,message,country,countryCode,city,timezone,query",
+                    proxies=proxies,
+                    timeout=8,
+                    impersonate="chrome131",
+                )
+                data = r.json() if hasattr(r, "json") else {}
+                if str(data.get("status") or "").lower() == "success":
+                    eg = {
+                        "ok": True,
+                        "source": "ip-api",
+                        "ip": str(data.get("query") or ""),
+                        "cc": str(data.get("countryCode") or "").upper(),
+                        "country": str(data.get("country") or ""),
+                        "city": str(data.get("city") or ""),
+                        "timezone": str(data.get("timezone") or ""),
+                    }
+            except Exception as e2:
+                eg = {"ok": False, "error": str(e2)[:120]}
+
+        if eg.get("ok"):
+            info.update(
+                {
+                    "ok": True,
+                    "source": str(eg.get("source") or "probe"),
+                    "ip": str(eg.get("ip") or ""),
+                    "cc": str(eg.get("cc") or "").upper(),
+                    "country": str(eg.get("country") or ""),
+                    "city": str(eg.get("city") or ""),
+                    "timezone": str(eg.get("timezone") or ""),
+                    "error": "",
+                }
+            )
+        else:
+            info["error"] = str(eg.get("error") or "egress fail")[:160]
+    except Exception as e:
+        info["error"] = str(e)[:160]
+
+    if info.get("ok"):
+        fam = _ss_family_from_egress(
+            str(info.get("cc") or ""),
+            str(info.get("timezone") or ""),
+            str(info.get("city") or ""),
+        )
+        # 代理串 hint 兜底（探测无 cc 时）
+        if not fam:
+            fam = _ss_proxy_hint_family(raw)
+        info["family"] = fam
+        if not info.get("timezone") and fam and fam in _SS_FAMILY_DEFAULTS:
+            info["timezone"] = _SS_FAMILY_DEFAULTS[fam]["timezone"]
+
+    with _SS_EGRESS_LOCK:
+        prev_ok = _SS_EGRESS_BY_PROXY.get(key)
+        prev_ok = (
+            dict(prev_ok)
+            if isinstance(prev_ok, dict) and prev_ok.get("ok")
+            else None
+        )
+        # 强刷失败不覆盖上一份成功缓存（防偶发失败 → 全球乱跳）
+        if info.get("ok") or not prev_ok:
+            _SS_EGRESS_BY_PROXY[key] = dict(info)
+        else:
+            info = dict(prev_ok)
+            info["stale"] = True
+            info["refresh_error"] = str(info.get("error") or "")
+            _SS_EGRESS_BY_PROXY[key] = dict(info)
+        _SS_EGRESS_PROBE_COUNT[key] = int(_SS_EGRESS_PROBE_COUNT.get(key) or 0) + 1
+
+    if log_fn:
+        try:
+            if info.get("ok"):
+                log_fn(
+                    f"出口对齐 · {info.get('ip') or '?'} · "
+                    f"{info.get('cc') or '?'} {info.get('city') or ''} · "
+                    f"tz={info.get('timezone') or '?'} · "
+                    f"family={info.get('family') or 'unknown'} · "
+                    f"via {info.get('source')} · px={_ss_mask_proxy(raw)}",
+                    "info",
+                )
+            else:
+                log_fn(
+                    f"出口探测失败 · {info.get('error') or '?'} · "
+                    f"px={_ss_mask_proxy(raw)} · 指纹将全球轮（可设 STANDALONE_EGRESS_CC）",
+                    "warn",
+                )
+        except Exception:
+            pass
+    return info
+
+
+def _ss_invalidate_egress(proxy_spec: str = "") -> None:
+    """切代理后清该条缓存，下次强制复探。"""
+    key = (proxy_spec or "").strip() or "(direct)"
+    with _SS_EGRESS_LOCK:
+        _SS_EGRESS_BY_PROXY.pop(key, None)
+
+
+def _ss_aligned_region_pool(
+    proxy_spec: str = "",
+    idx: int = 0,
+    log_fn: Optional[Callable[[str, str], None]] = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    按当前代理出口锁指纹池（同国家簇）。
+    返回 (pool, egress_info)。
+    STANDALONE_LOCAL_ALIGN=0 / GROK_SS_FP_ALIGN=0 可关（调试用全球轮）。
+    """
+    align_off = (
+        os.environ.get("GROK_SS_FP_ALIGN")
+        or os.environ.get("STANDALONE_LOCAL_ALIGN")
+        or "1"
+    ).strip().lower() in ("0", "off", "false", "no")
+
+    force_env = (
+        os.environ.get("STANDALONE_EGRESS_REFRESH")
+        or os.environ.get("GROK_SS_EGRESS_REFRESH")
+        or ""
+    ).strip().lower() in ("1", "true", "yes", "on")
+    try:
+        every_n = int(
+            (
+                os.environ.get("STANDALONE_EGRESS_EVERY")
+                or os.environ.get("GROK_SS_EGRESS_EVERY")
+                or "3"
+            ).strip()
+            or "3"
+        )
+    except ValueError:
+        every_n = 3
+    every_n = max(0, every_n)
+    key = (proxy_spec or "").strip() or "(direct)"
+    with _SS_EGRESS_LOCK:
+        prev = dict(_SS_EGRESS_BY_PROXY.get(key) or {})
+        n_probe = int(_SS_EGRESS_PROBE_COUNT.get(key) or 0)
+    do_force = bool(force_env) or (
+        every_n > 0 and (idx <= 1 or n_probe == 0 or (idx - 1) % every_n == 0)
+    )
+    # 无缓存必须探
+    if not prev:
+        do_force = True
+
+    if align_off:
+        return list(_SS_FP_REGIONS), {"ok": False, "align_off": True, "family": ""}
+
+    eg = _ss_detect_egress(proxy_spec, force=do_force, log_fn=log_fn if do_force else None)
+    if do_force and eg.get("ok") and prev.get("ok") and log_fn:
+        old_ip = str(prev.get("ip") or "")
+        new_ip = str(eg.get("ip") or "")
+        old_fam = str(prev.get("family") or "")
+        new_fam = str(eg.get("family") or "")
+        try:
+            if old_ip and new_ip and old_ip != new_ip:
+                log_fn(
+                    f"出口漂移 · {old_ip}({old_fam or '?'}) → {new_ip}({new_fam or '?'}) · "
+                    f"指纹簇重锁 · idx={idx}",
+                    "warn" if old_fam and new_fam and old_fam != new_fam else "info",
+                )
+            elif old_fam and new_fam and old_fam != new_fam:
+                log_fn(
+                    f"出口国家簇变 · {old_fam} → {new_fam} · 指纹重锁 · idx={idx}",
+                    "warn",
+                )
+        except Exception:
+            pass
+
+    if not eg.get("ok"):
+        # 探测失败：代理串 hint → 仍尽量锁簇；都没有才全球轮
+        hint = _ss_proxy_hint_family(proxy_spec)
+        if hint:
+            pool = _ss_fp_pool_for_family(hint, eg)
+            eg = dict(eg)
+            eg["family"] = hint
+            eg["family_source"] = "proxy_hint"
+            return pool, eg
+        return list(_SS_FP_REGIONS), eg
+
+    fam = str(eg.get("family") or "")
+    pool = _ss_fp_pool_for_family(fam, eg)
+    if not pool:
+        pool = list(_SS_FP_REGIONS)
+    return pool, eg
+
+
+def _ss_pick_fp(
+    idx: int = 0,
+    proxy_spec: str = "",
+    log_fn: Optional[Callable[[str, str], None]] = None,
+) -> dict[str, Any]:
+    """
+    打散指纹：OS/分辨率/时序轮转 + 近期去重。
+    地区/时区按当前代理出口国家簇锁定（防 IP↔locale 乱跳）。
+    """
+    pool, eg = _ss_aligned_region_pool(proxy_spec, idx=idx, log_fn=log_fn)
+    n = len(pool) or 1
+    # 同簇内 jump：只换 OS/次要 tag，不跳国
+    jump_p = 0.55
     try:
         jump_p = float(
             (
@@ -204,16 +718,18 @@ def _ss_pick_fp(idx: int = 0) -> dict[str, Any]:
         )
     except ValueError:
         jump_p = 0.55
-    jump_p = max(0.15, min(0.95, jump_p))
+    # 同簇池小时 jump 无害；全球池时 jump 仍危险——但 align 开着时 pool 已是同簇
+    jump_p = max(0.0, min(0.95, jump_p))
 
     def _one_region() -> dict[str, Any]:
+        if n <= 1:
+            return dict(pool[0])
         if idx and n:
-            # 主序跨步更大（*5），邻域更宽，减少周期感
             base = (max(0, int(idx) - 1) * 5 + random.randint(0, 4)) % n
             if random.random() < jump_p:
-                return random.choice(_SS_FP_REGIONS)
-            return _SS_FP_REGIONS[base]
-        return random.choice(_SS_FP_REGIONS)
+                return dict(random.choice(pool))
+            return dict(pool[base])
+        return dict(random.choice(pool))
 
     timing_env = (
         os.environ.get("STANDALONE_TIMING")
@@ -223,7 +739,6 @@ def _ss_pick_fp(idx: int = 0) -> dict[str, Any]:
 
     def _one_timing() -> str:
         if timing_env in ("rotate", "random", "rand", "mix", ""):
-            # 略抬 normal，压纯 turbo 连发
             return random.choices(
                 ["turbo", "fast", "normal", "human"],
                 weights=[32, 38, 22, 8],
@@ -248,7 +763,6 @@ def _ss_pick_fp(idx: int = 0) -> dict[str, Any]:
             pref = str(region.get("fp_os") or "windows").strip().lower()
             if pref not in _SS_FP_OS_POOL:
                 pref = "windows"
-            # 55% 池内随机，更打散 OS
             if random.random() < 0.55:
                 return random.choice(list(_SS_FP_OS_POOL))
             return pref
@@ -271,33 +785,50 @@ def _ss_pick_fp(idx: int = 0) -> dict[str, Any]:
             return True
         return random.random() < 0.75
 
-    #  ass 最多 8 次：撞近期签名就换区/OS/时序
+    fam = str(eg.get("family") or "")
+    cc = str(eg.get("cc") or "").upper()
+    eg_ip = str(eg.get("ip") or "")
+
     fp: dict[str, Any] = {}
     for _try in range(8):
         region = _one_region()
         timing = _one_timing()
         fp_os = _one_os(region)
         vw, vh = random.choice(_SS_VIEWPORT_BASES)
-        # 分辨率再抖一截
         vw = max(1180, min(2560, vw + random.randint(-36, 40)))
         vh = max(700, min(1600, vh + random.randint(-28, 32)))
-        # 偶发非 16:9 常见比，再打散
         if random.random() < 0.12:
             vw = max(1200, vw + random.randint(-80, 120))
             vh = max(720, int(vw * random.uniform(0.55, 0.72)))
+        base_tag = str(region.get("tag") or "LOCAL")
+        # tag 带出口 cc，方便日志对照
+        if eg.get("ok") and cc and cc not in base_tag.upper():
+            tag = f"{base_tag}@{cc}"
+        else:
+            tag = base_tag
         cand = {
-            "tag": region.get("tag") or "LOCAL",
+            "tag": tag,
             "locale": region.get("locale") or "en-US",
             "timezone": region.get("timezone") or "America/Los_Angeles",
             "fp_os": fp_os,
             "timing": timing,
             "viewport": {"width": int(vw), "height": int(vh)},
             "humanize": _one_humanize(timing),
+            "egress_ip": eg_ip,
+            "egress_cc": cc,
+            "egress_family": fam,
+            "egress_tz": str(eg.get("timezone") or ""),
         }
+        # 探测到更准的 tz 时，同簇内可微调（不跨族）
+        if eg.get("ok") and eg.get("timezone") and fam:
+            eg_tz = str(eg.get("timezone") or "")
+            if _ss_family_from_egress(cc, eg_tz, "") == fam and eg_tz:
+                # 50% 用探测 tz（城市级更贴），其余用池内标准 tz
+                if random.random() < 0.45:
+                    cand["timezone"] = eg_tz
         sig = _ss_fp_sig(cand)
         with _SS_RECENT_FP_LOCK:
             recent = set(_SS_RECENT_FP_SIGS)
-            # 同 tag+os+tz 在近 12 条里出现过 → 重抽
             coarse = f"{cand['tag']}|{cand['fp_os']}|{cand['timezone']}"
             coarse_hit = any(
                 s.startswith(coarse + "|") or s.startswith(coarse)
@@ -309,20 +840,25 @@ def _ss_pick_fp(idx: int = 0) -> dict[str, Any]:
             fp = cand
             break
     if not fp:
-        # 兜底：强制随机区 + 记签名
-        region = random.choice(_SS_FP_REGIONS)
+        region = _one_region()
         timing = _one_timing()
         vw, vh = random.choice(_SS_VIEWPORT_BASES)
         vw = max(1200, vw + random.randint(-20, 20))
         vh = max(700, vh + random.randint(-16, 16))
+        base_tag = str(region.get("tag") or "LOCAL")
+        tag = f"{base_tag}@{cc}" if (eg.get("ok") and cc and cc not in base_tag.upper()) else base_tag
         fp = {
-            "tag": region.get("tag") or "LOCAL",
+            "tag": tag,
             "locale": region.get("locale") or "en-US",
             "timezone": region.get("timezone") or "America/Los_Angeles",
             "fp_os": _one_os(region),
             "timing": timing,
             "viewport": {"width": int(vw), "height": int(vh)},
             "humanize": _one_humanize(timing),
+            "egress_ip": eg_ip,
+            "egress_cc": cc,
+            "egress_family": fam,
+            "egress_tz": str(eg.get("timezone") or ""),
         }
         with _SS_RECENT_FP_LOCK:
             _SS_RECENT_FP_SIGS.append(_ss_fp_sig(fp))
@@ -1317,9 +1853,15 @@ class RegisterEngine:
         # 创邮尝试次数：数量 N = 创建 N 个邮箱就停（CLEAN/MARKED/失败都计 1 次）
         self.attempt_count = 0
         self._ss_attempt_lock = threading.Lock()
-        # 连续 risk MARKED（跨线程）：触顶熔断，避免同出口 deny 簇空烧
+        # 连续 risk MARKED（跨线程）：触顶熔断 / 切代理 / 冷却
         self._ss_consecutive_deny = 0
         self._ss_deny_lock = threading.Lock()
+        # 代理池轮换状态（跨 worker 共享）
+        self._ss_proxy_pool: list[str] = []
+        self._ss_proxy_idx = 0
+        self._ss_proxy_switches = 0  # 本轮连续切代理次数
+        self._ss_cooldown_until = 0.0
+        self._ss_proxy_lock = threading.Lock()
         self.target_count = 0
         self.workers = 0
         self.start_time: Optional[float] = None
@@ -1353,6 +1895,142 @@ class RegisterEngine:
         with self._ss_idx_lock:
             self._ss_idx += 1
             return self._ss_idx
+
+    def _init_proxy_pool(self) -> None:
+        """任务启动时装载代理池。"""
+        pool = _ss_load_proxy_pool()
+        with self._ss_proxy_lock:
+            self._ss_proxy_pool = list(pool)
+            self._ss_proxy_idx = 0
+            self._ss_proxy_switches = 0
+            self._ss_cooldown_until = 0.0
+        if pool:
+            self.log(
+                f"代理池 {len(pool)} 条 · 当前 {_ss_mask_proxy(pool[0])}"
+                f" · 切代理上限={_ss_proxy_switch_limit() or 'off'}"
+                f" · 冷却={_ss_cooldown_sec():.0f}s",
+                "info",
+            )
+        else:
+            self.log("代理池空 · 直连", "info")
+
+    def _current_proxy_spec(self) -> str:
+        """当前生效代理（空=直连）。"""
+        with self._ss_proxy_lock:
+            pool = list(self._ss_proxy_pool or [])
+            idx = int(self._ss_proxy_idx or 0)
+        if not pool:
+            return ""
+        return pool[idx % len(pool)]
+
+    def _wait_proxy_cooldown(self) -> bool:
+        """
+        若处于冷却窗口则阻塞等待（全局，所有 worker 同步）。
+        返回 True = 被 stop_event 打断应退出；False = 可继续。
+        多线程：只有「清零 until 的 leader」打结束日志，避免刷屏。
+        """
+        with self._ss_proxy_lock:
+            until = float(self._ss_cooldown_until or 0.0)
+        remain = until - time.time()
+        if remain <= 0:
+            return False
+        # 进入冷却提示：每线程最多偶发，用 until 戳做简易去重
+        log_key = f"cd:{int(until)}"
+        if getattr(self, "_ss_cd_log_key", None) != log_key:
+            self._ss_cd_log_key = log_key
+            self.log(
+                f"代理熔断冷却中 · 剩余 {remain:.0f}s · 到点继续",
+                "warn",
+            )
+        # 分段睡，方便 stop；期间若其它线程已清 until，提前退出
+        end = time.time() + remain
+        while time.time() < end:
+            if self.stop_event.is_set():
+                return True
+            with self._ss_proxy_lock:
+                cur_until = float(self._ss_cooldown_until or 0.0)
+            if cur_until <= 0 or cur_until < until - 0.01:
+                # 已被 leader 清掉
+                return False
+            if self._sleep(min(1.0, max(0.05, end - time.time()))):
+                return True
+        with self._ss_proxy_lock:
+            # 冷却结束：只复位计数，不额外再切一次
+            # （进冷却时 _on_deny_rotate_proxy 已经切到下一条了）
+            still_mine = abs(float(self._ss_cooldown_until or 0.0) - until) < 0.5
+            if still_mine and float(self._ss_cooldown_until or 0.0) > 0:
+                self._ss_cooldown_until = 0.0
+                self._ss_proxy_switches = 0
+                self._ss_consecutive_deny = 0
+                leader = True
+            else:
+                leader = False
+            pool = list(self._ss_proxy_pool or [])
+            idx = int(self._ss_proxy_idx or 0)
+            cur = pool[idx % len(pool)] if pool else ""
+        if leader:
+            self.log(
+                f"冷却结束 · 继续 · 代理={_ss_mask_proxy(cur) if cur else '(direct)'}",
+                "info",
+            )
+        return False
+
+    def _on_deny_rotate_proxy(self) -> str:
+        """
+        deny/MARKED 熔断处理：
+          - 有多代理：切换下一条；连续切换达上限 → 进冷却
+          - 单代理/无池：按 deny_break 停批（由调用方读 consecutive_deny）
+        返回动作标签：switched / cooldown / none / single
+        """
+        switch_limit = _ss_proxy_switch_limit()
+        cool_sec = _ss_cooldown_sec()
+        with self._ss_proxy_lock:
+            pool = list(self._ss_proxy_pool or [])
+            # 池≤1 或 切代理上限=0 → 不轮换，走单出口 deny_break 停批
+            if len(pool) <= 1 or switch_limit <= 0:
+                return "single"
+            # 切下一条
+            old_idx = int(self._ss_proxy_idx or 0)
+            new_idx = (old_idx + 1) % len(pool)
+            self._ss_proxy_idx = new_idx
+            self._ss_proxy_switches = int(self._ss_proxy_switches or 0) + 1
+            switches = self._ss_proxy_switches
+            old_p = pool[old_idx]
+            new_p = pool[new_idx]
+            # 切代理后本代理 deny 计数清零，让新出口重新计
+            self._ss_consecutive_deny = 0
+            # 新出口指纹缓存失效，下一号强制复探
+            try:
+                _ss_invalidate_egress(new_p)
+            except Exception:
+                pass
+            if switch_limit > 0 and switches >= switch_limit:
+                self._ss_proxy_switches = 0
+                if cool_sec > 0:
+                    self._ss_cooldown_until = time.time() + float(cool_sec)
+                    action = "cooldown"
+                else:
+                    # 冷却=0：视为立即继续，不写 until，避免浮点残差误进冷却窗
+                    self._ss_cooldown_until = 0.0
+                    action = "switched"
+            else:
+                action = "switched"
+        if action == "cooldown":
+            self.log(
+                f"deny 熔断 · 已连续切代理 {switches} 次 · "
+                f"进入冷却 {cool_sec:.0f}s"
+                f"（{_ss_mask_proxy(old_p)} → {_ss_mask_proxy(new_p)}）",
+                "warn",
+            )
+        else:
+            self.log(
+                f"deny 熔断 · 切代理"
+                f"（{_ss_mask_proxy(old_p)} → {_ss_mask_proxy(new_p)}）"
+                f" · 本轮切换 {switches}"
+                + (f"/{switch_limit}" if switch_limit else ""),
+                "warn",
+            )
+        return action
 
     def _freeze_elapsed(self) -> None:
         """任务结束时钉死 end_time，页面耗时不再往上爬。"""
@@ -1420,6 +2098,16 @@ class RegisterEngine:
                 for it in self.recent_success
             ],
             "running": self.status in ("initializing", "running", "stopping"),
+            "proxy_pool_size": len(getattr(self, "_ss_proxy_pool", None) or []),
+            "proxy_current": _ss_mask_proxy(self._current_proxy_spec())
+            if hasattr(self, "_ss_proxy_pool")
+            else "",
+            "proxy_switches": int(getattr(self, "_ss_proxy_switches", 0) or 0),
+            "consecutive_deny": int(getattr(self, "_ss_consecutive_deny", 0) or 0),
+            "cooldown_remain": max(
+                0.0,
+                float(getattr(self, "_ss_cooldown_until", 0) or 0) - time.time(),
+            ),
         }
 
     def is_running(self) -> bool:
@@ -2275,17 +2963,24 @@ class RegisterEngine:
             return
 
         site_key = self.config.get("site_key") or "0x4AAAAAAAhr9JGVDZbrZOo0"
-        proxy_spec_str = _ss_local_proxy_spec()
         current_email = None
         # 数量 N = 创建 N 个邮箱就停（对齐 standalone COUNT）
         # 不再「凑满 N 个 CLEAN 无限补」；失败/MARKED 也各占 1 次创邮额度
         max_attempts = max(1, int(self.target_count or 1))
         consecutive_browser_fails = 0
         deny_break_n = _ss_deny_break_n()
+        switch_limit = _ss_proxy_switch_limit()
+        cool_sec = _ss_cooldown_sec()
+        pool_n = len(getattr(self, "_ss_proxy_pool", None) or []) or len(
+            _ss_load_proxy_pool()
+        )
         self.log(
             f"same_session · 数量={max_attempts}（按创邮次数停）"
             f" · 连续MARKED熔断={deny_break_n or 'off'}"
-            f" · 代理={proxy_spec_str}",
+            f" · 代理池={pool_n}"
+            f" · 切代理上限={switch_limit or 'off'}"
+            f" · 冷却={cool_sec:.0f}s"
+            f" · 当前={_ss_mask_proxy(self._current_proxy_spec())}",
             "info",
         )
 
@@ -2303,13 +2998,29 @@ class RegisterEngine:
                 )
                 self.stop_event.set()
                 return
-            # 连续 MARKED 熔断：同出口 Castle deny 簇打开后别硬刚
+            # 冷却窗口：连续切代理仍 deny 后等自定义秒数再继续
+            if self._wait_proxy_cooldown():
+                return
+            # 每号取当前代理（可能被其它线程 deny 后切过）
+            proxy_spec_str = self._current_proxy_spec()
+            # 连续 MARKED 熔断：
+            #   多代理 → 不在这里停批，等 MARKED 回调里切代理
+            #   单代理/无池 → 触顶停批（旧行为）
             with self._ss_deny_lock:
                 cur_deny = int(self._ss_consecutive_deny or 0)
-            if deny_break_n > 0 and cur_deny >= deny_break_n:
+            multi_proxy = len(getattr(self, "_ss_proxy_pool", None) or []) > 1
+            # 多代理且允许切代理时，不在这里停批（由 MARKED 路径切代理/冷却）
+            # 单出口 或 切代理上限=0：触顶停批
+            can_rotate = multi_proxy and switch_limit > 0
+            if (
+                not can_rotate
+                and deny_break_n > 0
+                and cur_deny >= deny_break_n
+            ):
                 self.log(
                     f"连续 MARKED/deny {cur_deny}/{deny_break_n} · 熔断停批"
-                    f"（同出口 registration 密度过高，换出口/冷却后再开）",
+                    f"（{'切代理已关' if multi_proxy else '单出口'}，"
+                    f"换出口/加池/打开切代理后再开）",
                     "error",
                 )
                 self.stop_event.set()
@@ -2326,7 +3037,12 @@ class RegisterEngine:
                     )
                 if self._sleep(jitter):
                     return
-            fp = _ss_pick_fp(idx)
+            # 指纹按当前代理出口国家簇锁定（防 IP↔locale 乱跳）
+            fp = _ss_pick_fp(
+                idx,
+                proxy_spec=proxy_spec_str,
+                log_fn=lambda m, lv="info": self.log(m, lv),
+            )
             email = None
             try:
                 # 每号开始：force 清本线程 Playwright loop，防池线程复用脏 loop
@@ -2447,6 +3163,13 @@ class RegisterEngine:
                     fp["lang"] = _lp["lang"]
                 except Exception:
                     fp.setdefault("accept_language", "")
+                eg_bit = ""
+                if fp.get("egress_ip") or fp.get("egress_cc"):
+                    eg_bit = (
+                        f" · egress={fp.get('egress_ip') or '?'}"
+                        f"/{fp.get('egress_cc') or '?'}"
+                        f"/{fp.get('egress_family') or '?'}"
+                    )
                 self.log(
                     f"开始注册[same_session]: {email} · "
                     f"[{attempt_i}/{max_attempts}] · "
@@ -2455,6 +3178,7 @@ class RegisterEngine:
                     f"al={str(fp.get('accept_language') or '')[:28]} · "
                     f"vp={vp.get('width')}x{vp.get('height')}"
                     f"{' · humanize' if fp.get('humanize') else ''} · "
+                    f"px={_ss_mask_proxy(proxy_spec_str)}{eg_bit} · "
                     f"CLEAN={self.success_count} MARKED={getattr(self, 'marked_count', 0)} "
                     f"fail={self.fail_count}",
                     "info",
@@ -2612,7 +3336,7 @@ class RegisterEngine:
                             f"（MARKED累计 {getattr(self, 'marked_count', 0)}"
                             f" · 连续 {streak}"
                             + (f"/{deny_break_n}" if deny_break_n else "")
-                            + "）"
+                            + f" · px={_ss_mask_proxy(proxy_spec_str)}）"
                         )
                         self._fail_account(
                             email_service,
@@ -2621,9 +3345,18 @@ class RegisterEngine:
                             level="warn",
                             count_fail=False,
                         )
-                        if deny_break_n > 0 and streak >= deny_break_n:
+                        # deny = 熔断信号：多代理 → 切代理；连续切 N 次仍 deny → 冷却
+                        # 单代理 / 切代理关闭(switch_limit=0) → 触顶停批
+                        multi = len(getattr(self, "_ss_proxy_pool", None) or []) > 1
+                        action = "single"
+                        if multi:
+                            action = self._on_deny_rotate_proxy()
+                            # cooldown：循环头 _wait_proxy_cooldown 处理
+                        if action == "single" and deny_break_n > 0 and streak >= deny_break_n:
                             self.log(
-                                f"连续 MARKED/deny 已达 {streak} · 熔断停批",
+                                f"连续 MARKED/deny 已达 {streak} · 熔断停批"
+                                f"（{'切代理已关/单出口' if multi else '单出口'}，"
+                                f"加代理池或打开切代理上限可自动轮换）",
                                 "error",
                             )
                             self.stop_event.set()
@@ -2641,9 +3374,11 @@ class RegisterEngine:
                         return
                     continue
 
-                # —— 仅 CLEAN 路径：清零连续 MARKED ——
+                # —— 仅 CLEAN 路径：清零连续 MARKED + 切代理计数 ——
                 with self._ss_deny_lock:
                     self._ss_consecutive_deny = 0
+                with self._ss_proxy_lock:
+                    self._ss_proxy_switches = 0
                 ua = (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -3418,6 +4153,8 @@ class RegisterEngine:
             self.end_time = None  # 新一轮重新计时
             self.error_message = ""
             self.recent_success.clear()
+            # 装载代理池（deny 熔断切代理 / 冷却）
+            self._init_proxy_pool()
             # 先标 initializing，避免并发 /api/start 重复拉起
             self.status = "initializing"
             # 不清空缓存的 action_id；initialize 会优先用缓存

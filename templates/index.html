@@ -221,14 +221,14 @@
       }
     }
     #logBox, #postLogBox { width: 100%; min-width: 0; }
-    /* 配置页：平铺分组，面板内滚动 */
-    #tab-config {
+    /* 配置/代理页：平铺分组，面板内滚动 */
+    #tab-config, #tab-proxy {
       max-height: min(72vh, 42rem);
       overflow-y: auto;
       scrollbar-width: thin;
       scrollbar-color: #d5cdb8 transparent;
     }
-    #tab-config .cfg-block {
+    #tab-config .cfg-block, #tab-proxy .cfg-block {
       border: 1px solid rgba(26, 23, 18, 0.08);
       border-radius: 0.9rem;
       background: #fff;
@@ -236,7 +236,7 @@
       display: grid;
       gap: 0.65rem;
     }
-    #tab-config .cfg-title {
+    #tab-config .cfg-title, #tab-proxy .cfg-title {
       font-size: 0.8125rem;
       font-weight: 700;
       color: #1a1712;
@@ -244,15 +244,17 @@
       padding-bottom: 0.15rem;
       border-bottom: 1px solid rgba(26, 23, 18, 0.06);
     }
-    #tab-config .field-label { margin-bottom: 0.2rem; }
-    #tab-config .field { padding: 0.55rem 0.7rem; }
-    #tab-config .hint {
+    #tab-config .field-label, #tab-proxy .field-label { margin-bottom: 0.2rem; }
+    #tab-config .field, #tab-proxy .field { padding: 0.55rem 0.7rem; }
+    #tab-config .hint, #tab-proxy .hint {
       margin-top: 0.2rem;
       font-size: 10px;
       line-height: 1.35;
       color: rgba(63, 58, 51, 0.45);
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
+    #mailDomainMulti label:hover { background: rgba(24, 87, 171, 0.04); border-radius: 0.4rem; }
+    #cfgProxyList { min-height: 9rem; }
     .secret-wrap { position: relative; }
     .secret-wrap .field { padding-right: 2.6rem; }
     .secret-wrap .toggle-eye {
@@ -345,6 +347,7 @@
           <span>成功 <span id="statSuccessInline" class="text-leaf-600">0</span> / 目标 <span id="statTargetInline" class="text-ink-800">0</span></span>
           <span>创邮 <span id="statAttemptInline" class="text-ink-800">0</span> / <span id="statAttemptTargetInline" class="text-ink-800">0</span></span>
           <span>CLEAN <span id="statCleanInline" class="text-leaf-600">0</span> · MARKED <span id="statMarked" class="text-sun-500">0</span></span>
+          <span>代理：<span id="statProxy" class="text-ink-800">—</span></span>
           <span>输出：<span id="outputFile" class="text-ink-800">—</span></span>
           <span>Action：<span id="actionId" class="text-ink-800">—</span></span>
         </div>
@@ -363,6 +366,7 @@
             <div class="flex gap-1 p-1.5 bg-paper-100 border-b border-ink-900/5">
               <button type="button" data-tab="run" class="tab-btn active flex-1 rounded-xl px-3 py-2 text-sm text-ink-700/70">运行</button>
               <button type="button" data-tab="config" class="tab-btn flex-1 rounded-xl px-3 py-2 text-sm text-ink-700/70">配置</button>
+              <button type="button" data-tab="proxy" class="tab-btn flex-1 rounded-xl px-3 py-2 text-sm text-ink-700/70">代理</button>
               <button type="button" data-tab="keys" class="tab-btn flex-1 rounded-xl px-3 py-2 text-sm text-ink-700/70">Keys</button>
             </div>
 
@@ -480,39 +484,21 @@
                   </div>
                   <div>
                     <div class="flex items-center justify-between gap-2 mb-1">
-                      <label class="field-label" style="margin-bottom:0" for="cfgMailDomain">邮箱后缀</label>
+                      <label class="field-label" style="margin-bottom:0">邮箱后缀（多选轮换）</label>
                       <button type="button" id="btnFetchDomains" class="btn btn-ghost text-[11px] px-2 py-0.5">拉取</button>
                     </div>
-                    <div class="c-select" data-select="cfgMailDomain">
-                      <button type="button" class="c-select-btn" id="cfgMailDomainBtn">
-                        <span class="value">自动（服务端默认）</span>
-                        <svg class="chev" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.17l3.71-3.94a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/></svg>
-                      </button>
-                      <div class="c-select-menu" role="listbox"></div>
-                      <input type="hidden" id="cfgMailDomain" value="auto" />
+                    <input type="hidden" id="cfgMailDomain" value="auto" />
+                    <div id="mailDomainMulti" class="rounded-xl border border-ink-900/10 bg-paper-50 px-2.5 py-2 max-h-36 overflow-y-auto space-y-1">
+                      <label class="flex items-center gap-2 text-[12px] font-mono text-ink-800 cursor-pointer select-none">
+                        <input type="checkbox" class="mail-dom-cb rounded border-paper-300 text-brand-500 focus:ring-brand-500/30" value="auto" checked />
+                        <span>自动（服务端默认）</span>
+                      </label>
                     </div>
-                    <p id="mailDomainHint" class="hint">点「拉取」从 freemail 取可用后缀</p>
+                    <p id="mailDomainHint" class="hint">点「拉取」取后缀；可多选，建邮时 round-robin 轮换</p>
                   </div>
                 </div>
 
-                <!-- 2. 代理 -->
-                <div class="cfg-block">
-                  <h3 class="cfg-title">注册代理</h3>
-                  <div>
-                    <label class="field-label" for="cfgProxy">GROK_PROXY</label>
-                    <input id="cfgProxy" type="text" class="field font-mono text-sm" placeholder="空=直连 · 127.0.0.1:7897" autocomplete="off" spellcheck="false" />
-                    <p class="hint">host:port · http/socks5:// · user:pass@host:port · host:port:user:pass</p>
-                    <div class="mt-1.5 flex items-start gap-2">
-                      <button type="button" id="btnProxyTest" class="btn btn-ghost text-[11px] px-2.5 py-1 shrink-0">测试代理</button>
-                      <div class="flex-1 min-w-0 space-y-0.5">
-                        <p id="proxyEgressLine" class="text-[11px] font-mono leading-snug text-ink-700/45 break-all hidden"></p>
-                        <p id="proxyTestMessage" class="text-[11px] font-mono leading-snug text-ink-700/50 break-all"></p>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <!-- 3. Solver -->
+                <!-- 2. Solver -->
                 <div class="cfg-block">
                   <h3 class="cfg-title">Turnstile / Solver</h3>
                   <div>
@@ -553,7 +539,7 @@
                   </div>
                 </div>
 
-                <!-- 4. sub2api -->
+                <!-- 3. sub2api -->
                 <div class="cfg-block">
                   <h3 class="cfg-title">sub2api 导入</h3>
                   <div>
@@ -588,7 +574,7 @@
                   <p id="upstreamTestMessage" class="text-[11px] font-mono min-h-[1rem] text-ink-700/50"></p>
                 </div>
 
-                <!-- 5. UI -->
+                <!-- 4. UI -->
                 <div class="cfg-block">
                   <h3 class="cfg-title">控制台监听</h3>
                   <div class="grid grid-cols-2 gap-2">
@@ -603,6 +589,62 @@
                   </div>
                 </div>
               </form>
+            </div>
+
+            <!-- PROXY PANEL -->
+            <div id="tab-proxy" class="p-4 space-y-3 hidden">
+              <div class="flex items-center justify-between gap-2">
+                <div>
+                  <h2 class="font-display font-semibold text-ink-900 text-sm">代理 / 熔断</h2>
+                  <p class="text-[10px] text-ink-700/45 font-mono">池轮换 · deny 切代理 · 冷却</p>
+                </div>
+                <div class="flex items-center gap-1.5">
+                  <button type="button" id="btnReloadProxy" class="btn btn-ghost text-[11px] px-2.5 py-1">重载</button>
+                  <button type="button" id="btnSaveProxy" class="btn btn-primary text-[11px] px-3 py-1.5">保存</button>
+                </div>
+              </div>
+              <p id="proxyPageMessage" class="text-[11px] font-mono min-h-[1rem] text-ink-700/50 -mt-1"></p>
+
+              <div class="cfg-block">
+                <h3 class="cfg-title">代理池</h3>
+                <div>
+                  <label class="field-label" for="cfgProxyList">一行一条 · 空=直连</label>
+                  <textarea id="cfgProxyList" class="field font-mono text-[11px] leading-snug w-full min-h-[9rem] resize-y" placeholder="127.0.0.1:7897&#10;socks5://user:pass@host:3000&#10;host:port:user:pass" spellcheck="false" autocomplete="off"></textarea>
+                  <p class="hint">host:port · http/socks5:// · user:pass@host:port · host:port:user:pass · 也支持分号/逗号分隔</p>
+                  <p id="proxyFormatHint" class="hint mt-1"></p>
+                </div>
+                <div class="flex flex-wrap items-center gap-1.5">
+                  <button type="button" id="btnProxyValidate" class="btn btn-ghost text-[11px] px-2.5 py-1">校验格式</button>
+                  <button type="button" id="btnProxyTest" class="btn btn-ghost text-[11px] px-2.5 py-1">测首条</button>
+                  <button type="button" id="btnProxyTestAll" class="btn btn-ghost text-[11px] px-2.5 py-1">测全部</button>
+                </div>
+                <div class="space-y-0.5 min-w-0">
+                  <p id="proxyEgressLine" class="text-[11px] font-mono leading-snug text-ink-700/45 break-all hidden"></p>
+                  <p id="proxyTestMessage" class="text-[11px] font-mono leading-snug text-ink-700/50 break-all"></p>
+                </div>
+              </div>
+
+              <div class="cfg-block">
+                <h3 class="cfg-title">熔断配置</h3>
+                <p class="hint -mt-1">deny / risk MARKED → 切下一条代理；连续切满 N 次仍 deny → 冷却后再继续</p>
+                <div class="grid grid-cols-3 gap-2">
+                  <div>
+                    <label class="field-label" for="cfgDenyBreak">单出口连续 deny</label>
+                    <input id="cfgDenyBreak" class="field font-mono text-sm" type="number" min="0" max="100" placeholder="3" />
+                    <p class="hint">仅 1 条/直连时停批；0=关</p>
+                  </div>
+                  <div>
+                    <label class="field-label" for="cfgProxySwitch">切代理上限</label>
+                    <input id="cfgProxySwitch" class="field font-mono text-sm" type="number" min="0" max="50" placeholder="3" />
+                    <p class="hint">连续切 N 次进冷却</p>
+                  </div>
+                  <div>
+                    <label class="field-label" for="cfgCooldownSec">冷却秒数</label>
+                    <input id="cfgCooldownSec" class="field font-mono text-sm" type="number" min="0" max="86400" placeholder="60" />
+                    <p class="hint">到点自动继续</p>
+                  </div>
+                </div>
+              </div>
             </div>
 
             <!-- KEYS PANEL -->
@@ -890,23 +932,98 @@
       }
     );
 
-    const AUTO_DOMAIN_OPT = { value: 'auto', label: '自动（服务端默认）' };
-    const mailDomainSelect = initSelect(
-      document.querySelector('[data-select="cfgMailDomain"]'),
-      [AUTO_DOMAIN_OPT],
-      'auto'
-    );
+    /* ---------- 邮箱域名多选 ---------- */
+    let _mailDomainCatalog = []; // 拉取到的全部域名
+    let _mailDomainDefaults = [];
 
-    function buildDomainOptions(domains, defaults) {
-      const opts = [AUTO_DOMAIN_OPT];
+    function getSelectedMailDomains() {
+      const box = $('mailDomainMulti');
+      if (!box) return ['auto'];
+      const checked = [...box.querySelectorAll('.mail-dom-cb:checked')].map(el => el.value);
+      const real = checked.filter(v => v && v !== 'auto');
+      if (!real.length) return ['auto'];
+      return real;
+    }
+
+    function setSelectedMailDomains(selected) {
+      const box = $('mailDomainMulti');
+      if (!box) return;
+      let list = Array.isArray(selected)
+        ? selected
+        : String(selected || 'auto').split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
+      if (!list.length) list = ['auto'];
+      const onlyAuto = list.length === 1 && list[0].toLowerCase() === 'auto';
+      const want = new Set(onlyAuto ? ['auto'] : list.filter(d => d.toLowerCase() !== 'auto'));
+      box.querySelectorAll('.mail-dom-cb').forEach(cb => {
+        if (cb.value === 'auto') cb.checked = onlyAuto || want.size === 0;
+        else cb.checked = want.has(cb.value);
+      });
+      // 已选但不在列表：补 checkbox
+      if (!onlyAuto) {
+        want.forEach(d => {
+          if (![...box.querySelectorAll('.mail-dom-cb')].some(cb => cb.value === d)) {
+            const lab = document.createElement('label');
+            lab.className = 'flex items-center gap-2 text-[12px] font-mono text-ink-800 cursor-pointer select-none px-0.5 py-0.5';
+            lab.innerHTML = `<input type="checkbox" class="mail-dom-cb rounded border-paper-300 text-brand-500 focus:ring-brand-500/30" value="${escapeHtml(d)}" checked /><span>${escapeHtml(d)}</span>`;
+            box.appendChild(lab);
+          }
+        });
+      }
+      syncMailDomainHidden();
+    }
+
+    function syncMailDomainHidden() {
+      const hidden = $('cfgMailDomain');
+      if (!hidden) return;
+      const sel = getSelectedMailDomains();
+      hidden.value = sel.join(',');
+    }
+
+    function renderMailDomainMulti(domains, defaults, keepSelected) {
+      const box = $('mailDomainMulti');
+      if (!box) return;
+      const prev = keepSelected ? getSelectedMailDomains() : ['auto'];
       const defSet = new Set((defaults || []).map(String));
+      const items = [{ value: 'auto', label: '自动（服务端默认）' }];
       for (const d of domains || []) {
         const v = String(d).trim();
         if (!v || v === 'auto') continue;
-        const tag = defSet.has(v) ? '（默认）' : '';
-        opts.push({ value: v, label: tag ? `${v} ${tag}` : v });
+        items.push({ value: v, label: defSet.has(v) ? `${v}（默认）` : v });
       }
-      return opts;
+      // 保留已选但不在 catalog 的
+      for (const p of prev) {
+        if (p !== 'auto' && !items.some(it => it.value === p)) {
+          items.push({ value: p, label: p });
+        }
+      }
+      box.innerHTML = items.map(it => `
+        <label class="flex items-center gap-2 text-[12px] font-mono text-ink-800 cursor-pointer select-none px-0.5 py-0.5">
+          <input type="checkbox" class="mail-dom-cb rounded border-paper-300 text-brand-500 focus:ring-brand-500/30" value="${escapeHtml(it.value)}" />
+          <span>${escapeHtml(it.label)}</span>
+        </label>
+      `).join('');
+      // auto 与其它互斥（只绑一次，避免重复 render 叠监听）
+      if (!box._mailDomBound) {
+        box._mailDomBound = true;
+        box.addEventListener('change', (ev) => {
+          const t = ev.target;
+          if (!t || !t.classList.contains('mail-dom-cb')) return;
+          if (t.value === 'auto' && t.checked) {
+            box.querySelectorAll('.mail-dom-cb').forEach(cb => {
+              if (cb.value !== 'auto') cb.checked = false;
+            });
+          } else if (t.value !== 'auto' && t.checked) {
+            const autoCb = box.querySelector('.mail-dom-cb[value="auto"]');
+            if (autoCb) autoCb.checked = false;
+          }
+          if (![...box.querySelectorAll('.mail-dom-cb:checked')].length) {
+            const autoCb = box.querySelector('.mail-dom-cb[value="auto"]');
+            if (autoCb) autoCb.checked = true;
+          }
+          syncMailDomainHidden();
+        });
+      }
+      setSelectedMailDomains(prev);
     }
 
     $('targetCustom').addEventListener('input', () => {
@@ -924,11 +1041,13 @@
       btn.addEventListener('click', () => {
         document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
-        ['run', 'config', 'keys'].forEach(name => {
-          $('tab-' + name).classList.toggle('hidden', btn.dataset.tab !== name);
+        ['run', 'config', 'proxy', 'keys'].forEach(name => {
+          const el = $('tab-' + name);
+          if (el) el.classList.toggle('hidden', btn.dataset.tab !== name);
         });
         if (btn.dataset.tab === 'keys') refreshKeys();
         if (btn.dataset.tab === 'config') loadConfig();
+        if (btn.dataset.tab === 'proxy') loadProxyPage();
       });
     });
 
@@ -1034,6 +1153,16 @@
       $('progressBar').style.width = `${data.progress ?? 0}%`;
       $('outputFile').textContent = data.output_file || '—';
       $('actionId').textContent = data.action_id ? data.action_id.slice(0, 18) + '…' : '—';
+      if ($('statProxy')) {
+        const cur = (data.proxy_current || '').trim();
+        const poolN = Number(data.proxy_pool_size || 0);
+        const cool = Number(data.cooldown_remain || 0);
+        const sw = Number(data.proxy_switches || 0);
+        let pxText = cur || (poolN ? `池${poolN}` : '直连');
+        if (cool > 0.5) pxText += ` · 冷却${Math.ceil(cool)}s`;
+        else if (sw > 0) pxText += ` · 切${sw}`;
+        $('statProxy').textContent = pxText;
+      }
       if ($('statMode')) {
         const m = data.register_mode || 'same_session';
         $('statMode').textContent = m === 'same_session' ? '同会话 CLEAN' : '旧协议';
@@ -1070,26 +1199,34 @@
         $('envWorker').textContent = okW ? (data.env.worker_domain || '已配置') : '未配置';
         $('envWorker').className = `font-mono truncate max-w-[58%] text-right ${okW ? 'text-leaf-600' : 'text-rose-500'}`;
         const md = data.env.freemail_domain || 'auto';
-        $('envMailDomain').textContent = md === 'auto' ? '自动' : md;
-        $('envMailDomain').className = 'font-mono text-ink-800';
+        if (md === 'auto') {
+          $('envMailDomain').textContent = '自动';
+        } else {
+          const parts = String(md).split(/[,;]+/).map(s => s.trim()).filter(Boolean);
+          $('envMailDomain').textContent = parts.length > 1
+            ? `${parts[0]} +${parts.length - 1}`
+            : (parts[0] || md);
+        }
+        $('envMailDomain').className = 'font-mono text-ink-800 truncate max-w-[58%] text-right';
         $('envToken').textContent = okT ? '已配置' : '未配置';
         $('envToken').className = `font-mono ${okT ? 'text-leaf-600' : 'text-rose-500'}`;
         $('envYes').textContent = data.env.yescaptcha_set ? 'YesCaptcha' : '本地 Solver';
         $('envYes').className = 'font-mono text-ink-800';
         $('envSolver').textContent = data.env.solver_url || 'http://127.0.0.1:5072';
         if ($('envProxy')) {
+          const cnt = Number(data.env.grok_proxy_count || 0);
           const px = (data.env.grok_proxy || '').trim();
-          if (px) {
-            // 侧栏脱敏：有账号只显示 host 段
-            let show = px;
+          const cur = (data.proxy_current || '').trim();
+          if (cnt > 1 || px || cur) {
+            let show = cur || px;
             try {
-              if (px.includes('@')) show = px.split('@').pop();
-              else if ((px.match(/:/g) || []).length >= 3) {
-                const parts = px.split(':');
+              if (show.includes('@')) show = show.split('@').pop();
+              else if ((show.match(/:/g) || []).length >= 3) {
+                const parts = show.split(':');
                 show = parts.slice(0, 2).join(':') + ':***';
               }
             } catch (_) {}
-            $('envProxy').textContent = show;
+            $('envProxy').textContent = cnt > 1 ? `池${cnt} · ${show}` : show;
             $('envProxy').className = 'font-mono truncate max-w-[58%] text-right text-leaf-600';
           } else {
             $('envProxy').textContent = '直连';
@@ -1300,17 +1437,22 @@
         const data = await res.json().catch(() => ({}));
         const domains = data.domains || [];
         const defaults = data.default_domains || [];
-        const selected = data.selected || $('cfgMailDomain').value || 'auto';
-        mailDomainSelect._setOptions(buildDomainOptions(domains, defaults), true);
-        // 若当前选中不在列表且不是 auto，保留；否则用接口 selected
-        const cur = $('cfgMailDomain').value;
-        if (cur && (cur === 'auto' || domains.includes(cur))) {
-          mailDomainSelect._setValue(cur === 'auto' ? (selected || 'auto') : cur, true);
-        } else if (selected) {
-          mailDomainSelect._setValue(selected, true);
+        _mailDomainCatalog = domains;
+        _mailDomainDefaults = defaults;
+        const keep = getSelectedMailDomains();
+        renderMailDomainMulti(domains, defaults, true);
+        // 若当前仍是 auto 且接口有 selected，且 selected 在列表里，可选中它
+        if (keep.length === 1 && keep[0] === 'auto' && data.selected && data.selected !== 'auto') {
+          if (domains.includes(data.selected)) {
+            setSelectedMailDomains([data.selected]);
+          }
+        } else {
+          setSelectedMailDomains(keep);
         }
         if (data.ok) {
-          hint.textContent = data.message || `已拉取 ${domains.length} 个域名`;
+          const n = getSelectedMailDomains().filter(d => d !== 'auto').length;
+          hint.textContent = (data.message || `已拉取 ${domains.length} 个域名`)
+            + (n > 1 ? ` · 已选 ${n} 个轮换` : '');
           hint.className = 'mt-1 text-[11px] text-leaf-600';
         } else {
           hint.textContent = data.message || '拉取失败';
@@ -1328,6 +1470,113 @@
       }
     }
 
+    function _proxyListLines() {
+      const ta = $('cfgProxyList');
+      if (!ta) return [];
+      return String(ta.value || '')
+        .split(/[\n,;]+/)
+        .map(s => s.trim())
+        .filter(s => s && !s.startsWith('#'));
+    }
+
+    function _firstProxyLine() {
+      const lines = _proxyListLines();
+      return lines[0] || '';
+    }
+
+    async function loadProxyPage() {
+      try {
+        const data = await fetchJSON('/api/config');
+        const c = data.config || {};
+        let pool = (c.GROK_PROXY_LIST || '').trim();
+        if (!pool && (c.GROK_PROXY || '').trim()) pool = (c.GROK_PROXY || '').trim();
+        if ($('cfgProxyList')) $('cfgProxyList').value = pool;
+        if ($('cfgDenyBreak')) $('cfgDenyBreak').value = c.GROK_SS_DENY_BREAK != null ? c.GROK_SS_DENY_BREAK : '3';
+        if ($('cfgProxySwitch')) $('cfgProxySwitch').value = c.GROK_SS_PROXY_SWITCH_LIMIT != null ? c.GROK_SS_PROXY_SWITCH_LIMIT : '3';
+        if ($('cfgCooldownSec')) $('cfgCooldownSec').value = c.GROK_SS_COOLDOWN_SEC != null ? c.GROK_SS_COOLDOWN_SEC : '60';
+        const n = _proxyListLines().length;
+        setMessage($('proxyPageMessage'), n ? `已加载代理池 ${n} 条` : '已加载（直连）', true);
+        if ($('proxyFormatHint')) {
+          $('proxyFormatHint').textContent = n ? `当前 ${n} 条` : '空=直连';
+          $('proxyFormatHint').className = 'hint mt-1';
+        }
+        if ($('proxyTestMessage')) {
+          $('proxyTestMessage').textContent = '';
+          $('proxyTestMessage').className = 'text-[11px] font-mono leading-snug text-ink-700/50 break-all';
+        }
+        if ($('proxyEgressLine')) {
+          $('proxyEgressLine').textContent = '';
+          $('proxyEgressLine').classList.add('hidden');
+        }
+      } catch (e) {
+        setMessage($('proxyPageMessage'), e.message || '加载失败', false);
+      }
+    }
+
+    async function saveProxyPage() {
+      if (state.running) {
+        setMessage($('proxyPageMessage'), '任务运行中，请先停止再改代理/熔断', false);
+        return;
+      }
+      const lines = _proxyListLines();
+      const payload = {
+        GROK_PROXY_LIST: lines.join('\n'),
+        GROK_PROXY: lines[0] || '',
+        GROK_SS_DENY_BREAK: ($('cfgDenyBreak') && $('cfgDenyBreak').value.trim()) || '3',
+        GROK_SS_PROXY_SWITCH_LIMIT: ($('cfgProxySwitch') && $('cfgProxySwitch').value.trim()) || '3',
+        GROK_SS_COOLDOWN_SEC: ($('cfgCooldownSec') && $('cfgCooldownSec').value.trim()) || '60',
+      };
+      setMessage($('proxyPageMessage'), '保存中…', true);
+      if ($('btnSaveProxy')) $('btnSaveProxy').disabled = true;
+      try {
+        const data = await fetchJSON('/api/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        setMessage($('proxyPageMessage'), data.message || '已保存', true);
+        if (data.env) {
+          renderStatus({ ...(state.lastStatus || {}), env: data.env, status: (state.lastStatus && state.lastStatus.status) || 'idle' });
+        }
+        // 回显规范化
+        if (data.config) {
+          const pool = (data.config.GROK_PROXY_LIST || '').replace(/;/g, '\n');
+          if ($('cfgProxyList') && pool) $('cfgProxyList').value = pool.split('\n').filter(Boolean).join('\n');
+        }
+      } catch (e) {
+        setMessage($('proxyPageMessage'), e.message || '保存失败', false);
+      } finally {
+        if ($('btnSaveProxy')) $('btnSaveProxy').disabled = false;
+      }
+    }
+
+    async function validateProxyFormat() {
+      const lines = _proxyListLines();
+      const hint = $('proxyFormatHint');
+      const msg = $('proxyPageMessage');
+      try {
+        const data = await fetchJSON('/api/proxy/validate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ proxies: lines.join('\n') }),
+        });
+        if (hint) {
+          hint.textContent = data.message || '';
+          hint.className = `hint mt-1 ${data.ok ? 'text-leaf-600' : 'text-rose-500'}`;
+        }
+        setMessage(msg, data.message || (data.ok ? '格式正确' : '有格式错误'), !!data.ok);
+        if (!data.ok && Array.isArray(data.items)) {
+          const bad = data.items.filter(it => !it.ok).slice(0, 3)
+            .map(it => `#${it.index} ${it.raw}`).join(' · ');
+          if (bad && hint) hint.textContent = (data.message || '') + ' · ' + bad;
+        }
+        return data;
+      } catch (e) {
+        setMessage(msg, e.message || '校验失败', false);
+        return null;
+      }
+    }
+
     async function loadConfig() {
       try {
         const data = await fetchJSON('/api/config');
@@ -1340,7 +1589,13 @@
         solverBrowserSelect._setValue(c.SOLVER_BROWSER || 'camoufox', true);
         $('cfgUiHost').value = c.UI_HOST || '127.0.0.1';
         $('cfgUiPort').value = c.UI_PORT || '3333';
-        if ($('cfgProxy')) $('cfgProxy').value = c.GROK_PROXY || '';
+        // 同步代理页字段（若已打开）
+        let pool = (c.GROK_PROXY_LIST || '').trim();
+        if (!pool && (c.GROK_PROXY || '').trim()) pool = (c.GROK_PROXY || '').trim();
+        if ($('cfgProxyList')) $('cfgProxyList').value = pool;
+        if ($('cfgDenyBreak')) $('cfgDenyBreak').value = c.GROK_SS_DENY_BREAK != null ? c.GROK_SS_DENY_BREAK : '3';
+        if ($('cfgProxySwitch')) $('cfgProxySwitch').value = c.GROK_SS_PROXY_SWITCH_LIMIT != null ? c.GROK_SS_PROXY_SWITCH_LIMIT : '3';
+        if ($('cfgCooldownSec')) $('cfgCooldownSec').value = c.GROK_SS_COOLDOWN_SEC != null ? c.GROK_SS_COOLDOWN_SEC : '60';
         if ($('cfgUpstreamUrl')) $('cfgUpstreamUrl').value = c.SUB2API_URL || c.UPSTREAM_URL || 'http://127.0.0.1:9898';
         if ($('cfgUpstreamEmail')) $('cfgUpstreamEmail').value = c.UPSTREAM_ADMIN_EMAIL || '';
         if ($('cfgUpstreamPwd')) $('cfgUpstreamPwd').value = c.UPSTREAM_ADMIN_PASSWORD || '';
@@ -1351,30 +1606,21 @@
         $('yesCaptchaBlock').classList.toggle('hidden', mode !== 'yescaptcha');
 
         const savedDomain = (c.FREEMAIL_DOMAIN || 'auto').trim() || 'auto';
-        mailDomainSelect._setOptions(buildDomainOptions(
-          savedDomain !== 'auto' ? [savedDomain] : [],
-          []
-        ), false);
-        mailDomainSelect._setValue(savedDomain, true);
+        const savedList = savedDomain.split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
+        const seedDomains = savedList.filter(d => d.toLowerCase() !== 'auto');
+        renderMailDomainMulti(seedDomains.length ? seedDomains : _mailDomainCatalog, _mailDomainDefaults, false);
+        setSelectedMailDomains(savedList);
 
         setMessage($('configMessage'), '已加载当前配置', true);
         if ($('upstreamTestMessage')) {
           $('upstreamTestMessage').textContent = '';
           $('upstreamTestMessage').className = 'text-[11px] font-mono min-h-[1.1rem] text-ink-700/50';
         }
-        if ($('proxyTestMessage')) {
-          $('proxyTestMessage').textContent = '';
-          $('proxyTestMessage').className = 'text-[11px] font-mono leading-snug text-ink-700/50 break-all';
-        }
-        if ($('proxyEgressLine')) {
-          $('proxyEgressLine').textContent = '';
-          $('proxyEgressLine').classList.add('hidden');
-        }
         // 有 Worker 时自动拉取域名列表
         if (c.WORKER_DOMAIN) {
           fetchMailDomains(true).then((r) => {
             if (r && r.ok) {
-              mailDomainSelect._setValue(savedDomain, true);
+              setSelectedMailDomains(savedList);
             }
           });
         }
@@ -1457,17 +1703,19 @@
     $('configForm').addEventListener('submit', async (ev) => {
       ev.preventDefault();
       const captchaMode = $('captchaMode').value;
+      syncMailDomainHidden();
+      const mailDomains = getSelectedMailDomains();
+      // 配置页只存邮箱/solver/sub2api；代理与熔断只在「代理」页保存，避免空 textarea 误清空池
       const payload = {
         WORKER_DOMAIN: $('cfgWorker').value.trim(),
         FREEMAIL_TOKEN: $('cfgToken').value.trim(),
-        FREEMAIL_DOMAIN: ($('cfgMailDomain').value || 'auto').trim() || 'auto',
+        FREEMAIL_DOMAIN: mailDomains.join(',') || 'auto',
         YESCAPTCHA_KEY: captchaMode === 'yescaptcha' ? $('cfgYes').value.trim() : '',
         SOLVER_URL: $('cfgSolver').value.trim() || 'http://127.0.0.1:5072',
         SOLVER_BROWSER: $('cfgSolverBrowser').value || 'camoufox',
         SOLVER_THREADS: $('cfgSolverThreads').value.trim() || '2',
         UI_HOST: $('cfgUiHost').value.trim() || '127.0.0.1',
         UI_PORT: $('cfgUiPort').value.trim() || '3333',
-        GROK_PROXY: ($('cfgProxy') && $('cfgProxy').value.trim()) || '',
         SUB2API_URL: ($('cfgUpstreamUrl') && $('cfgUpstreamUrl').value.trim()) || 'http://127.0.0.1:9898',
         UPSTREAM_URL: ($('cfgUpstreamUrl') && $('cfgUpstreamUrl').value.trim()) || 'http://127.0.0.1:9898',
         UPSTREAM_ADMIN_EMAIL: ($('cfgUpstreamEmail') && $('cfgUpstreamEmail').value.trim()) || '',
@@ -1611,48 +1859,89 @@
       msg.className = 'text-[11px] font-mono leading-snug text-rose-500 break-all';
     }
 
-    async function testProxyConnectivity() {
-      const btn = $('btnProxyTest');
+    async function testProxyConnectivity(opts) {
+      opts = opts || {};
+      const testAll = !!opts.all;
+      const btn = testAll ? $('btnProxyTestAll') : $('btnProxyTest');
       const msg = $('proxyTestMessage');
       const eg = $('proxyEgressLine');
+      const lines = _proxyListLines();
+      const first = lines[0] || '';
       if (btn) btn.disabled = true;
+      if ($('btnProxyTest')) $('btnProxyTest').disabled = true;
+      if ($('btnProxyTestAll')) $('btnProxyTestAll').disabled = true;
       if (eg) {
-        eg.textContent = '① 探测出口 IP / 区域…';
+        eg.textContent = testAll
+          ? `① 批量测 ${lines.length || 1} 条出口…`
+          : '① 探测出口 IP / 区域…';
         eg.className = 'text-[11px] font-mono leading-snug text-ink-700/50 break-all';
         eg.classList.remove('hidden');
       }
       if (msg) {
-        msg.textContent = '② 等待出口后测 x.ai…';
+        msg.textContent = testAll ? '② 逐条测 x.ai…' : '② 等待出口后测 x.ai…';
         msg.className = 'text-[11px] font-mono leading-snug text-ink-700/45 break-all';
       }
       try {
+        const body = testAll
+          ? { GROK_PROXY_LIST: lines.join('\n'), test_all: true }
+          : { GROK_PROXY: first, GROK_PROXY_LIST: lines.join('\n') };
         const data = await fetchJSON('/api/proxy/test', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            // 用输入框当前值（可先测再保存）；空=直连
-            GROK_PROXY: ($('cfgProxy') && $('cfgProxy').value.trim()) || '',
-          }),
+          body: JSON.stringify(body),
         });
-        _paintProxyEgress(data);
-        _paintProxyXai(data, null);
+        if (testAll && Array.isArray(data.results)) {
+          const okN = data.ok_count != null ? data.ok_count : data.results.filter(r => r.ok).length;
+          if (msg) {
+            msg.textContent = data.message || `批量 ${okN}/${data.total || lines.length} 通`;
+            msg.className = `text-[11px] font-mono leading-snug break-all ${okN ? 'text-leaf-600' : 'text-rose-500'}`;
+          }
+          const firstOk = data.results.find(r => r.ok) || data.results[0];
+          if (firstOk) _paintProxyEgress(firstOk);
+          setMessage($('proxyPageMessage'), msg ? msg.textContent : '', !!okN);
+        } else {
+          _paintProxyEgress(data);
+          _paintProxyXai(data, null);
+        }
       } catch (e) {
-        // fetchJSON 在 502 时抛错，但 body 可能在 e.data
         const d = e.data || {};
-        _paintProxyEgress(d);
-        if (d && (d.message || d.error || d.egress_ip != null)) {
-          _paintProxyXai(d, e);
-        } else if (msg) {
-          msg.textContent = e.message || '测试失败';
-          msg.className = 'text-[11px] font-mono leading-snug text-rose-500 break-all';
+        if (testAll && Array.isArray(d.results)) {
+          const okN = d.ok_count || 0;
+          if (msg) {
+            msg.textContent = d.message || `批量 ${okN}/${d.total || lines.length} 通`;
+            msg.className = 'text-[11px] font-mono leading-snug text-rose-500 break-all';
+          }
+          const firstR = d.results[0];
+          if (firstR) _paintProxyEgress(firstR);
+        } else {
+          _paintProxyEgress(d);
+          if (d && (d.message || d.error || d.egress_ip != null)) {
+            _paintProxyXai(d, e);
+          } else if (msg) {
+            msg.textContent = e.message || '测试失败';
+            msg.className = 'text-[11px] font-mono leading-snug text-rose-500 break-all';
+          }
         }
       } finally {
-        if (btn) btn.disabled = false;
+        if ($('btnProxyTest')) $('btnProxyTest').disabled = false;
+        if ($('btnProxyTestAll')) $('btnProxyTestAll').disabled = false;
       }
     }
 
     if ($('btnProxyTest')) {
-      $('btnProxyTest').addEventListener('click', () => { testProxyConnectivity(); });
+      $('btnProxyTest').addEventListener('click', () => { testProxyConnectivity({ all: false }); });
+    }
+    if ($('btnProxyTestAll')) {
+      $('btnProxyTestAll').addEventListener('click', () => { testProxyConnectivity({ all: true }); });
+    }
+    if ($('btnProxyValidate')) {
+      $('btnProxyValidate').addEventListener('click', () => { validateProxyFormat(); });
+    }
+    if ($('btnSaveProxy')) {
+      $('btnSaveProxy').addEventListener('click', () => { saveProxyPage(); });
+    }
+    if ($('btnReloadProxy')) {
+      $('btnReloadProxy').addEventListener('click', () => { loadProxyPage(); });
     }
 
     async function importToUpstream(ids, opts) {

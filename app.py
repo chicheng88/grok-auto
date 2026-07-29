@@ -115,6 +115,10 @@ CONFIG_KEYS = (
     "UPSTREAM_ADMIN_EMAIL",
     "UPSTREAM_ADMIN_PASSWORD",
     "GROK_PROXY",
+    "GROK_PROXY_LIST",
+    "GROK_SS_DENY_BREAK",
+    "GROK_SS_PROXY_SWITCH_LIMIT",
+    "GROK_SS_COOLDOWN_SEC",
 )
 
 DEFAULTS = {
@@ -145,6 +149,14 @@ DEFAULTS = {
     "UPSTREAM_ADMIN_PASSWORD": "",
     # 注册代理：空=直连；支持 host:port / http://host:port / user:pass@host:port / host:port:user:pass
     "GROK_PROXY": "",
+    # 多行代理池（优先于 GROK_PROXY）；换行/逗号/分号分隔
+    "GROK_PROXY_LIST": "",
+    # 熔断：单代理连续 deny 停批阈值；0=off（多代理时优先切代理，不靠这个停）
+    "GROK_SS_DENY_BREAK": "3",
+    # deny 后连续切换代理次数上限，触顶进入冷却
+    "GROK_SS_PROXY_SWITCH_LIMIT": "3",
+    # 冷却秒数（连续切代理仍 deny 后等待再继续）
+    "GROK_SS_COOLDOWN_SEC": "60",
 }
 
 
@@ -220,8 +232,12 @@ def write_env_file(values: dict) -> None:
             f"UI_HOST={values.get('UI_HOST', DEFAULTS['UI_HOST'])}",
             f"UI_PORT={values.get('UI_PORT', DEFAULTS['UI_PORT'])}",
             "",
-            "# 注册代理（空=直连）",
+            "# 注册代理（空=直连；池用分号分隔）",
             f"GROK_PROXY={values.get('GROK_PROXY', DEFAULTS.get('GROK_PROXY', ''))}",
+            f"GROK_PROXY_LIST={values.get('GROK_PROXY_LIST', DEFAULTS.get('GROK_PROXY_LIST', ''))}",
+            f"GROK_SS_DENY_BREAK={values.get('GROK_SS_DENY_BREAK', DEFAULTS.get('GROK_SS_DENY_BREAK', '3'))}",
+            f"GROK_SS_PROXY_SWITCH_LIMIT={values.get('GROK_SS_PROXY_SWITCH_LIMIT', DEFAULTS.get('GROK_SS_PROXY_SWITCH_LIMIT', '3'))}",
+            f"GROK_SS_COOLDOWN_SEC={values.get('GROK_SS_COOLDOWN_SEC', DEFAULTS.get('GROK_SS_COOLDOWN_SEC', '60'))}",
             "",
             "# sub2api Grok（成功账号导入）",
             f"SUB2API_URL={values.get('SUB2API_URL', DEFAULTS['SUB2API_URL'])}",
@@ -242,14 +258,99 @@ def write_env_file(values: dict) -> None:
     ENV_PATH.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
 
 
+def _split_proxy_lines(raw: str) -> list[str]:
+    """把代理池文本拆成行：支持换行 / 逗号 / 分号；忽略 # 注释与空行。"""
+    text = (raw or "").replace("\r\n", "\n").replace("\r", "\n")
+    parts: list[str] = []
+    for chunk in re.split(r"[\n,;]+", text):
+        line = chunk.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts.append(line)
+    # 去重保序
+    seen = set()
+    out: list[str] = []
+    for p in parts:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def _normalize_proxy_list_text(raw: str) -> str:
+    """规范化代理池：一行一个，便于前端 textarea 回显。"""
+    return "\n".join(_split_proxy_lines(raw))
+
+
+def _proxy_list_for_env(raw: str) -> str:
+    """落盘 .env：单行，分号分隔（.env 不支持裸多行值）。"""
+    return ";".join(_split_proxy_lines(raw))
+
+
+def _primary_proxy_from_values(proxy_list: str, single: str) -> str:
+    """池优先；否则单条 GROK_PROXY。"""
+    lines = _split_proxy_lines(proxy_list)
+    if lines:
+        return lines[0]
+    return (single or "").strip()
+
+
+def _split_mail_domains(raw: str) -> list[str]:
+    """邮箱后缀多选：逗号/分号/空白分隔；auto 单独表示服务端默认。"""
+    text = (raw or "").strip()
+    if not text:
+        return ["auto"]
+    parts: list[str] = []
+    for chunk in re.split(r"[,;\s]+", text):
+        d = chunk.strip().lower()
+        if not d:
+            continue
+        if d in ("auto", "default", "随机", "自动"):
+            # 有其它域名时忽略 auto；仅 auto 时保留
+            continue
+        if d not in parts:
+            parts.append(chunk.strip())  # 保留原始大小写域名
+    if not parts:
+        return ["auto"]
+    return parts
+
+
+def _normalize_mail_domains(raw: str) -> str:
+    """落盘：逗号分隔；单 auto 就写 auto。"""
+    domains = _split_mail_domains(raw)
+    if domains == ["auto"]:
+        return "auto"
+    return ",".join(domains)
+
+
 def _sync_proxy_env_aliases() -> None:
-    """把 GROK_PROXY 同步到注册链路读取的别名；空则全部清掉。"""
-    proxy = (os.environ.get("GROK_PROXY") or "").strip()
+    """
+    同步代理到注册链路别名。
+    优先 GROK_PROXY_LIST 首条 → GROK_PROXY；空则清掉别名。
+    完整池仍由 GROK_PROXY_LIST 环境变量提供给引擎轮换。
+    注意：进程环境里的池必须用分号单行，禁止写换行（部分宿主/dotenv 会截断）。
+    """
+    raw_pool = os.environ.get("GROK_PROXY_LIST") or ""
+    lines = _split_proxy_lines(raw_pool)
+    single = (os.environ.get("GROK_PROXY") or "").strip()
+    primary = lines[0] if lines else (single or "").strip()
+    if lines:
+        os.environ["GROK_PROXY_LIST"] = _proxy_list_for_env("\n".join(lines))
+    elif "GROK_PROXY_LIST" in os.environ and not raw_pool.strip():
+        os.environ["GROK_PROXY_LIST"] = ""
     for alias in ("GROK_PROXY", "XAI_PROXY", "SAME_SESSION_PROXY", "GROK_SAME_SESSION_PROXY"):
-        if proxy:
-            os.environ[alias] = proxy
+        if primary:
+            os.environ[alias] = primary
         else:
             os.environ.pop(alias, None)
+    # STANDALONE / same_session 也会读这些
+    if primary:
+        os.environ["STANDALONE_LOCAL_PROXY"] = primary
+        os.environ["LOCAL_PROXY"] = primary
+    else:
+        os.environ.pop("STANDALONE_LOCAL_PROXY", None)
+        os.environ.pop("LOCAL_PROXY", None)
 
 
 def apply_env_to_process(values: dict) -> None:
@@ -260,6 +361,17 @@ def apply_env_to_process(values: dict) -> None:
     # 以最终进程环境为准再同步代理别名（避免 dotenv 覆盖后别名不一致）
     if "GROK_PROXY" in values:
         os.environ["GROK_PROXY"] = str(values.get("GROK_PROXY") or "").strip()
+    if "GROK_PROXY_LIST" in values:
+        os.environ["GROK_PROXY_LIST"] = _proxy_list_for_env(
+            str(values.get("GROK_PROXY_LIST") or "")
+        )
+    for fuse_key in (
+        "GROK_SS_DENY_BREAK",
+        "GROK_SS_PROXY_SWITCH_LIMIT",
+        "GROK_SS_COOLDOWN_SEC",
+    ):
+        if fuse_key in values:
+            os.environ[fuse_key] = str(values.get(fuse_key) or "").strip()
     _sync_proxy_env_aliases()
 
 
@@ -287,7 +399,22 @@ def env_snapshot():
         "ui_host": cfg.get("UI_HOST") or DEFAULTS["UI_HOST"],
         "ui_port": cfg.get("UI_PORT") or DEFAULTS["UI_PORT"],
         "grok_proxy": (cfg.get("GROK_PROXY") or "").strip(),
-        "grok_proxy_set": bool((cfg.get("GROK_PROXY") or "").strip()),
+        "grok_proxy_set": bool(
+            (cfg.get("GROK_PROXY") or "").strip()
+            or (cfg.get("GROK_PROXY_LIST") or "").strip()
+        ),
+        "grok_proxy_list": _normalize_proxy_list_text(cfg.get("GROK_PROXY_LIST") or ""),
+        "grok_proxy_count": (
+            len(_split_proxy_lines(cfg.get("GROK_PROXY_LIST") or ""))
+            or (1 if (cfg.get("GROK_PROXY") or "").strip() else 0)
+        ),
+        "ss_deny_break": (cfg.get("GROK_SS_DENY_BREAK") or DEFAULTS["GROK_SS_DENY_BREAK"]).strip(),
+        "ss_proxy_switch_limit": (
+            cfg.get("GROK_SS_PROXY_SWITCH_LIMIT") or DEFAULTS["GROK_SS_PROXY_SWITCH_LIMIT"]
+        ).strip(),
+        "ss_cooldown_sec": (
+            cfg.get("GROK_SS_COOLDOWN_SEC") or DEFAULTS["GROK_SS_COOLDOWN_SEC"]
+        ).strip(),
         "sub2api_url": sub2_url,
         "sub2api_container": sub2["container"],
         "sub2api_group_id": sub2["group_id"],
@@ -1014,7 +1141,8 @@ def sub2api_import_sso_tokens_http(
         token=token,
         base_url=base_url,
         json_body=body,
-        timeout=120,
+        # 批量换票较慢：默认 5 分钟；可用 SUB2API_SSO_TIMEOUT 覆盖
+        timeout=float(os.environ.get("SUB2API_SSO_TIMEOUT") or 300),
     )
     if not resp.get("ok"):
         return {
@@ -1779,6 +1907,20 @@ def get_config():
             "UI_HOST": cfg.get("UI_HOST", DEFAULTS["UI_HOST"]),
             "UI_PORT": cfg.get("UI_PORT", DEFAULTS["UI_PORT"]),
             "GROK_PROXY": cfg.get("GROK_PROXY", DEFAULTS.get("GROK_PROXY", "")),
+            # 前端 textarea 用换行；.env 内部是分号
+            "GROK_PROXY_LIST": _normalize_proxy_list_text(
+                cfg.get("GROK_PROXY_LIST", DEFAULTS.get("GROK_PROXY_LIST", ""))
+            ),
+            "GROK_SS_DENY_BREAK": cfg.get(
+                "GROK_SS_DENY_BREAK", DEFAULTS.get("GROK_SS_DENY_BREAK", "3")
+            ),
+            "GROK_SS_PROXY_SWITCH_LIMIT": cfg.get(
+                "GROK_SS_PROXY_SWITCH_LIMIT",
+                DEFAULTS.get("GROK_SS_PROXY_SWITCH_LIMIT", "3"),
+            ),
+            "GROK_SS_COOLDOWN_SEC": cfg.get(
+                "GROK_SS_COOLDOWN_SEC", DEFAULTS.get("GROK_SS_COOLDOWN_SEC", "60")
+            ),
             "SUB2API_URL": cfg.get("SUB2API_URL", cfg.get("UPSTREAM_URL", DEFAULTS["SUB2API_URL"])),
             "SUB2API_DOCKER_CONTAINER": cfg.get("SUB2API_DOCKER_CONTAINER", DEFAULTS["SUB2API_DOCKER_CONTAINER"]),
             "SUB2API_DB_HOST": cfg.get("SUB2API_DB_HOST", DEFAULTS["SUB2API_DB_HOST"]),
@@ -1855,6 +1997,35 @@ def save_config():
         grok_proxy = str(body.get("GROK_PROXY") or "").strip()
     else:
         grok_proxy = str(current.get("GROK_PROXY", DEFAULTS.get("GROK_PROXY", "")) or "").strip()
+    # 代理池：多行/分号；优先于单条 GROK_PROXY
+    if "GROK_PROXY_LIST" in body:
+        grok_proxy_list_raw = str(body.get("GROK_PROXY_LIST") or "")
+    else:
+        grok_proxy_list_raw = str(
+            current.get("GROK_PROXY_LIST", DEFAULTS.get("GROK_PROXY_LIST", "")) or ""
+        )
+    # 熔断自定义
+    if "GROK_SS_DENY_BREAK" in body:
+        ss_deny_break = str(body.get("GROK_SS_DENY_BREAK") or "").strip()
+    else:
+        ss_deny_break = str(
+            current.get("GROK_SS_DENY_BREAK", DEFAULTS["GROK_SS_DENY_BREAK"]) or "3"
+        ).strip()
+    if "GROK_SS_PROXY_SWITCH_LIMIT" in body:
+        ss_switch_limit = str(body.get("GROK_SS_PROXY_SWITCH_LIMIT") or "").strip()
+    else:
+        ss_switch_limit = str(
+            current.get(
+                "GROK_SS_PROXY_SWITCH_LIMIT", DEFAULTS["GROK_SS_PROXY_SWITCH_LIMIT"]
+            )
+            or "3"
+        ).strip()
+    if "GROK_SS_COOLDOWN_SEC" in body:
+        ss_cooldown = str(body.get("GROK_SS_COOLDOWN_SEC") or "").strip()
+    else:
+        ss_cooldown = str(
+            current.get("GROK_SS_COOLDOWN_SEC", DEFAULTS["GROK_SS_COOLDOWN_SEC"]) or "60"
+        ).strip()
     sub2api_url = str(body.get("SUB2API_URL", body.get("UPSTREAM_URL", current.get("SUB2API_URL", current.get("UPSTREAM_URL", DEFAULTS["SUB2API_URL"]))))).strip()
     sub2api_container = str(body.get("SUB2API_DOCKER_CONTAINER", current.get("SUB2API_DOCKER_CONTAINER", DEFAULTS["SUB2API_DOCKER_CONTAINER"]))).strip() or DEFAULTS["SUB2API_DOCKER_CONTAINER"]
     sub2api_db_host = str(body.get("SUB2API_DB_HOST", current.get("SUB2API_DB_HOST", DEFAULTS["SUB2API_DB_HOST"]))).strip() or DEFAULTS["SUB2API_DB_HOST"]
@@ -1899,8 +2070,57 @@ def save_config():
 
     # 规范化 worker 域名
     worker = worker.replace("https://", "").replace("http://", "").strip().rstrip("/")
-    if mail_domain.lower() in ("", "auto", "default", "随机", "自动"):
-        mail_domain = "auto"
+    # 邮箱后缀多选：domain1,domain2 或 auto
+    mail_domain = _normalize_mail_domains(mail_domain)
+    # 代理池规范化 + 格式校验
+    proxy_lines = _split_proxy_lines(grok_proxy_list_raw)
+    # 兼容：池空但单条有值 → 当池只有一条
+    if not proxy_lines and grok_proxy:
+        proxy_lines = [grok_proxy]
+    invalid_proxies: list[str] = []
+    if proxy_lines:
+        try:
+            from g.same_session_register import parse_proxy_spec as _parse_px
+        except Exception:
+            _parse_px = None
+        if _parse_px:
+            for i, line in enumerate(proxy_lines, 1):
+                if not _parse_px(line):
+                    show = line if len(line) <= 48 else (line[:24] + "…" + line[-12:])
+                    invalid_proxies.append(f"#{i} {show}")
+        if invalid_proxies:
+            return jsonify({
+                "ok": False,
+                "message": "代理格式错误: " + "; ".join(invalid_proxies[:5])
+                + (" …" if len(invalid_proxies) > 5 else "")
+                + "。支持 host:port · http/socks5:// · user:pass@host:port · host:port:user:pass",
+            }), 400
+    grok_proxy_list = _proxy_list_for_env("\n".join(proxy_lines))
+    # 单条字段：池首条（兼容旧逻辑）；池空则直连
+    grok_proxy = proxy_lines[0] if proxy_lines else ""
+
+    # 熔断参数校验
+    def _parse_nonneg_int(raw: str, default: int, name: str, lo: int = 0, hi: int = 86400):
+        s = (raw or "").strip().lower()
+        if s in ("", "off", "false", "no", "none"):
+            return "0" if name != "GROK_SS_COOLDOWN_SEC" else str(default)
+        try:
+            n = int(s)
+        except ValueError:
+            raise ValueError(f"{name} 必须是整数")
+        if n < lo or n > hi:
+            raise ValueError(f"{name} 范围 {lo}-{hi}")
+        return str(n)
+
+    try:
+        ss_deny_break = _parse_nonneg_int(ss_deny_break, 3, "GROK_SS_DENY_BREAK", 0, 100)
+        ss_switch_limit = _parse_nonneg_int(
+            ss_switch_limit, 3, "GROK_SS_PROXY_SWITCH_LIMIT", 0, 50
+        )
+        ss_cooldown = _parse_nonneg_int(ss_cooldown, 60, "GROK_SS_COOLDOWN_SEC", 0, 86400)
+    except ValueError as ve:
+        return jsonify({"ok": False, "message": str(ve)}), 400
+
     sub2api_url = normalize_upstream_url(sub2api_url) or DEFAULTS["SUB2API_URL"]
     upstream_url = sub2api_url
 
@@ -1937,6 +2157,10 @@ def save_config():
         "UI_HOST": ui_host,
         "UI_PORT": ui_port,
         "GROK_PROXY": grok_proxy,
+        "GROK_PROXY_LIST": grok_proxy_list,
+        "GROK_SS_DENY_BREAK": ss_deny_break,
+        "GROK_SS_PROXY_SWITCH_LIMIT": ss_switch_limit,
+        "GROK_SS_COOLDOWN_SEC": ss_cooldown,
         "SUB2API_URL": sub2api_url,
         "SUB2API_DOCKER_CONTAINER": sub2api_container,
         "SUB2API_DB_HOST": sub2api_db_host,
@@ -1953,7 +2177,13 @@ def save_config():
     try:
         write_env_file(values)
         apply_env_to_process(values)
-        logs.emit(f"配置已保存到 .env（邮箱域名: {mail_domain}）", "success")
+        px_n = len(proxy_lines)
+        logs.emit(
+            f"配置已保存到 .env（邮箱域名: {mail_domain}"
+            f" · 代理池 {px_n} 条"
+            f" · 熔断 deny={ss_deny_break}/切代理={ss_switch_limit}/冷却={ss_cooldown}s）",
+            "success",
+        )
 
         # 保存后自动测试 sub2api HTTP 通道，并按名称解析 group_id 回写
         upstream_test = None
@@ -2612,29 +2842,166 @@ def _probe_register_proxy(raw: str, timeout: float = 12.0) -> dict:
     return result
 
 
+@app.post("/api/proxy/validate")
+def proxy_validate():
+    """
+    仅校验代理格式（不发网）。
+    body.proxies / GROK_PROXY_LIST / text：多行文本。
+    """
+    body = request.get_json(silent=True) or {}
+    raw = ""
+    if "proxies" in body:
+        raw = str(body.get("proxies") or "")
+    elif "GROK_PROXY_LIST" in body:
+        raw = str(body.get("GROK_PROXY_LIST") or "")
+    elif "text" in body:
+        raw = str(body.get("text") or "")
+    elif "GROK_PROXY" in body:
+        raw = str(body.get("GROK_PROXY") or "")
+    else:
+        raw = (
+            (os.environ.get("GROK_PROXY_LIST") or "").strip()
+            or (read_env_file().get("GROK_PROXY_LIST") or "").strip()
+            or (os.environ.get("GROK_PROXY") or "").strip()
+        )
+    lines = _split_proxy_lines(raw)
+    try:
+        from g.same_session_register import parse_proxy_spec
+    except Exception as e:
+        return jsonify({"ok": False, "message": f"parse_proxy_spec 不可用: {e}"}), 500
+    items = []
+    bad = 0
+    for i, line in enumerate(lines, 1):
+        parsed = parse_proxy_spec(line)
+        ok = bool(parsed and (parsed.get("server") or parsed.get("server_url")))
+        entry = {
+            "index": i,
+            "raw": line if len(line) <= 96 else (line[:48] + "…" + line[-20:]),
+            "ok": ok,
+        }
+        if ok:
+            entry["scheme"] = parsed.get("scheme") or ""
+            entry["server"] = parsed.get("server") or ""
+            if parsed.get("username"):
+                entry["auth"] = True
+        else:
+            bad += 1
+            entry["error"] = "格式无法解析"
+        items.append(entry)
+    return jsonify({
+        "ok": bad == 0,
+        "total": len(lines),
+        "valid": len(lines) - bad,
+        "invalid": bad,
+        "items": items,
+        "message": (
+            f"全部 {len(lines)} 条格式正确"
+            if lines and bad == 0
+            else (f"{bad}/{len(lines)} 条格式错误" if lines else "无代理（将直连）")
+        ),
+    })
+
+
 @app.post("/api/proxy/test")
 def proxy_test():
     """
     测试注册代理：先出口 IP/区域，再 accounts.x.ai 连通性。
     body.GROK_PROXY / proxy：可传临时值；不传则用当前已保存/进程环境。
+    body.GROK_PROXY_LIST / proxies：多条时测全部（或 body.index 指定第 N 条，1-based）。
     空字符串 = 直连探测。
     """
     body = request.get_json(silent=True) or {}
+    # 多代理批量
+    pool_raw = None
+    if "GROK_PROXY_LIST" in body:
+        pool_raw = str(body.get("GROK_PROXY_LIST") or "")
+    elif "proxies" in body:
+        pool_raw = str(body.get("proxies") or "")
+    lines = _split_proxy_lines(pool_raw) if pool_raw is not None else []
+
     if "GROK_PROXY" in body:
         raw = str(body.get("GROK_PROXY") or "").strip()
     elif "proxy" in body:
         raw = str(body.get("proxy") or "").strip()
+    elif lines:
+        raw = lines[0]
     else:
         raw = (
             (os.environ.get("GROK_PROXY") or "").strip()
             or (read_env_file().get("GROK_PROXY") or "").strip()
         )
+        if not raw:
+            saved_pool = _split_proxy_lines(
+                (os.environ.get("GROK_PROXY_LIST") or "")
+                or (read_env_file().get("GROK_PROXY_LIST") or "")
+            )
+            if saved_pool:
+                lines = saved_pool
+                raw = lines[0]
+
     try:
         timeout = float(body.get("timeout") or 12)
     except (TypeError, ValueError):
         timeout = 12.0
+
+    # 指定 index（1-based）或 test_all
+    test_all = bool(body.get("test_all") or body.get("all"))
+    idx = body.get("index")
+    if lines and idx is not None and str(idx).strip() != "":
+        try:
+            i = int(idx)
+            if 1 <= i <= len(lines):
+                raw = lines[i - 1]
+                lines = [raw]
+                test_all = False
+        except (TypeError, ValueError):
+            pass
+
+    if test_all and lines:
+        results = []
+        ok_n = 0
+        for i, line in enumerate(lines, 1):
+            r = _probe_register_proxy(line, timeout=timeout)
+            r["index"] = i
+            results.append(r)
+            if r.get("ok"):
+                ok_n += 1
+        summary = {
+            "ok": ok_n > 0,
+            "total": len(lines),
+            "ok_count": ok_n,
+            "fail_count": len(lines) - ok_n,
+            "results": results,
+            "message": f"批量测试 {ok_n}/{len(lines)} 通",
+            # 兼容单测字段：用第一条成功的，否则第一条
+            **(next((x for x in results if x.get("ok")), results[0] if results else {})),
+        }
+        try:
+            level = "success" if ok_n else "warn"
+            logs.emit(f"代理批量测试: {summary['message']}", level)
+        except Exception:
+            pass
+        code = 200 if ok_n else 502
+        return jsonify(summary), code
+
+    # 单条：先格式校验
+    if raw:
+        try:
+            from g.same_session_register import parse_proxy_spec
+            if not parse_proxy_spec(raw):
+                return jsonify({
+                    "ok": False,
+                    "proxy": raw[:80],
+                    "error": "代理格式无法解析",
+                    "message": (
+                        "格式错误。支持 host:port · http/socks5:// · "
+                        "user:pass@host:port · host:port:user:pass"
+                    ),
+                }), 400
+        except Exception:
+            pass
+
     result = _probe_register_proxy(raw, timeout=timeout)
-    # 写一条主日志，方便对照
     try:
         level = "success" if result.get("ok") else "warn"
         logs.emit(f"代理测试: {result.get('message') or result.get('error')}", level)

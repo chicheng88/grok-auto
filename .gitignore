@@ -39,3 +39,10 @@ logs/
 proxies*.txt
 *_proxy*.txt
 *.har
+
+# local-only
+proxies/
+_align_backup_*/
+_recall_old_sso.py
+_tmp_*.py
+

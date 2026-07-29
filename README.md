@@ -6,12 +6,15 @@ Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Cas
 
 - 同页 same-session 注册（Castle mint + 页内 fetch，默认 CLEAN 主路径）
 - 临时邮箱自动建邮 / 收码（[cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)）
+- **邮箱后缀多选**：建邮时 round-robin 轮换多个域名
 - 本地 Camoufox Turnstile Solver（也可接 YesCaptcha）
 - 多线程并发；主流程 / Risk·Token·NSFW 双栏日志
 - 进度按 CLEAN 成功数计；创邮次数单独展示（数量 = 创邮次数停批）
+- **独立「代理」页**：代理池、格式校验、测首条/测全部（出口 IP/地区 + accounts.x.ai）
+- **熔断轮换**：risk MARKED/deny → 切下一条代理；连续切满 N 次仍 deny → 自定义冷却后继续
+- **指纹按出口对齐**：探当前代理出口国家，locale/时区只在同国家簇内轮（防 IP↔指纹乱跳）
 - 注册成功后页面「导入」入库 sub2api（HTTP Admin API / sso-to-oauth；`AUTO_IMPORT=1` 可开自动）
 - 按**分组名称**自动解析 sub2api `group_id`（ID 只读缓存）
-- 配置页支持注册代理格式校验与连通性测试（出口 IP/地区 + accounts.x.ai）
 
 ## 目录结构
 
@@ -61,32 +64,65 @@ python setup_solver.py
 cp .env.example .env
 ```
 
-编辑 `.env`（**切勿提交**）：
+编辑 `.env`（**切勿提交真实密钥 / 代理账号 / 个人域名**）：
 
 | 配置项 | 说明 | 默认 |
 |--------|------|------|
 | `WORKER_DOMAIN` | cloudflare_temp_email 的 Worker 域名（不要 `https://`） | — |
 | `FREEMAIL_TOKEN` | 站点密码 / JWT | — |
-| `FREEMAIL_DOMAIN` | 邮箱后缀；`auto` 用服务端默认 | `auto` |
+| `FREEMAIL_DOMAIN` | 邮箱后缀：`auto` / 单域名 / 多域名逗号分隔（轮换） | `auto` |
 | `FREEMAIL_API_STYLE` | `auto` / `cf_temp` / `freemail` | `auto` |
 | `YESCAPTCHA_KEY` | 有则走 YesCaptcha；空则本地 Solver | 空 |
 | `SOLVER_URL` | 本地 Solver 地址 | `http://127.0.0.1:5072` |
 | `SOLVER_BROWSER` | `camoufox` / `chromium` | `camoufox` |
 | `SOLVER_THREADS` | Solver 浏览器线程 | `4` |
 | `UI_HOST` / `UI_PORT` | Web 监听 | `127.0.0.1` / `3333` |
-| `GROK_PROXY` | 注册代理；空=直连。支持 `host:port` / URL / `user:pass@host:port` / `host:port:user:pass` | 空 |
+| `GROK_PROXY` | 单条注册代理；空=直连 | 空 |
+| `GROK_PROXY_LIST` | 代理池（分号/换行分隔，优先于单条） | 空 |
+| `GROK_SS_DENY_BREAK` | 单出口连续 MARKED 停批阈值；`0`=关 | `3` |
+| `GROK_SS_PROXY_SWITCH_LIMIT` | deny 后连续切代理次数上限，触顶进冷却；`0`=不切 | `3` |
+| `GROK_SS_COOLDOWN_SEC` | 切代理触顶后的冷却秒数 | `60` |
+| `GROK_SS_FP_ALIGN` | `1`=指纹按出口国家簇锁定（推荐）；`0`=全球轮（仅调试） | `1` |
 | `SUB2API_URL` | sub2api 根地址 | `http://127.0.0.1:9898` |
 | `SUB2API_GROK_GROUP_NAME` | 导入目标分组**名称**（按名称解析 ID） | `grok` |
 | `SUB2API_GROK_GROUP_ID` | 可选缓存；运行时会按名称回写 | 空 |
 | `UPSTREAM_ADMIN_EMAIL` | sub2api 管理员邮箱 | — |
 | `UPSTREAM_ADMIN_PASSWORD` | sub2api 管理员密码 | — |
 
+### 代理格式
+
+支持：
+
+- `host:port`
+- `http://host:port` / `socks5://host:port`
+- `user:pass@host:port`
+- `host:port:user:pass`
+
+池子可写多行或用 `;` 分隔。控制台「代理」页可校验格式、测出口与 x.ai 连通。
+
+### 熔断逻辑（same_session）
+
+```
+risk MARKED / deny
+  ├─ 多代理且允许切代理 → 立刻切下一条
+  ├─ 连续切满 N 次仍 deny → 冷却 X 秒 → 到点继续
+  └─ 单代理 / 直连 / 切代理关闭 → 连续 deny 达阈值 → 停批
+CLEAN 成功 → 清零连续 deny 与切代理计数
+```
+
+### 指纹与出口
+
+- 启动/切代理后探测当前出口 IP 与国家码
+- locale / timezone 只在**同国家簇**内轮换（可轮 OS、分辨率、时序）
+- 探测失败时尝试从代理串 `region-XX` 猜测；再不行才全球轮
+- 可手填 `STANDALONE_EGRESS_CC` / `STANDALONE_EGRESS_TZ` 跳过探测
+
 说明：
 
-- 页面「配置」里只填**分组名称**；分组 ID 只读显示，保存/测试/导入时自动拉取。
-- 名称匹配的是 sub2api **已有**分组（可跨 platform）；新分组请先在 sub2api 后台创建。
+- 页面「配置」：邮箱 / Solver / sub2api；**代理与熔断只在「代理」页保存**，避免空池误清空。
+- 分组只填**名称**；ID 只读显示，保存/测试/导入时自动拉取。
 - 导入主路径：`POST /api/v1/admin/grok/sso-to-oauth`（服务端换票）。
-- 默认**不**自动入库；需要自动时在 `.env` 设 `AUTO_IMPORT=1`。
+- 需要自动入库时在 `.env` 设 `AUTO_IMPORT=1`。
 - Token 换票 / 协议 / NSFW 在成功后异步后台跑，不堵注册主路径。
 
 ## 使用
@@ -108,12 +144,13 @@ python app.py
 
 打开：`http://127.0.0.1:3333`
 
-- **配置**：邮箱 / Solver / 注册代理（可测出口与 x.ai）/ sub2api / 分组名称 → 写入 `.env`
+- **配置**：Worker / Token / 邮箱后缀（可多选）/ Solver / sub2api / 分组名称 → 写入 `.env`
+- **代理**：代理池、格式校验、连通测试、熔断三参数
 - **运行**：选择 `same_session`、并发、数量后开始
 - **日志**：左侧主流程（建邮→camoufox→signup→SSO），右侧 Risk / Token / NSFW
 - **Keys**：下载 SSO 文件，一键导入 sub2api
 
-same_session 建议并发先 **1～2**（注册浏览器 + Solver 双开）。
+same_session 建议并发先 **1～2**（注册浏览器 + Solver 双开）。进度条旁可看当前代理 / 冷却状态。
 
 ### 3. 命令行
 
@@ -141,3 +178,4 @@ python import_batch_once.py keys/your_sso.txt
 - 仅供学习与自用自动化，请遵守目标站点与服务条款。
 - 仓库不包含真实 `.env`、代理账号、邮箱密码、keys/logs。
 - 推送前请确认工作区无个人域名、代理凭证与内网地址。
+- 示例配置一律用占位符（`your-worker.workers.dev`、`admin@example.com` 等）。

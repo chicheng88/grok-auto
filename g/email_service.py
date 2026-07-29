@@ -6,6 +6,7 @@ import re
 import string
 import random
 import time
+import threading
 from typing import Optional
 
 import requests
@@ -32,11 +33,15 @@ class EmailService:
     每个邮箱会拿到独立 jwt，内部维护。
     """
 
+    # 多域名轮换：跨实例共享下标，建邮时 round-robin
+    _domain_rr_lock = threading.Lock()
+    _domain_rr_idx = 0
+
     def __init__(self):
         load_dotenv(override=True)
         self.worker_domain = self.normalize_domain(os.getenv("WORKER_DOMAIN") or "")
         self.freemail_token = (os.getenv("FREEMAIL_TOKEN") or "").strip()
-        self.mail_domain = (os.getenv("FREEMAIL_DOMAIN") or "").strip()  # 邮箱后缀，如 kikru.xyz
+        self.mail_domain = (os.getenv("FREEMAIL_DOMAIN") or "").strip()  # 邮箱后缀，如 example.com 或 a.com,b.com
         if not self.worker_domain:
             raise ValueError("Missing: WORKER_DOMAIN")
         self.base_url = f"https://{self.worker_domain}"
@@ -45,6 +50,7 @@ class EmailService:
         # 探测 API 风格：cf_temp | freemail
         self._api_style = (os.getenv("FREEMAIL_API_STYLE") or "auto").strip().lower()
         self._settings_cache: Optional[dict] = None
+        self._mail_domain_pool = self._parse_mail_domain_pool(self.mail_domain)
 
     @staticmethod
     def normalize_domain(domain: str) -> str:
@@ -197,12 +203,44 @@ class EmailService:
                 return None, None
         return self._create_freemail_legacy()
 
+    @staticmethod
+    def _parse_mail_domain_pool(raw: str) -> list[str]:
+        """
+        解析多选域名：逗号/分号/空白分隔。
+        返回空列表 = auto（服务端默认）；否则为域名列表（可轮换）。
+        """
+        text = (raw or "").strip()
+        if not text:
+            return []
+        parts: list[str] = []
+        for chunk in re.split(r"[,;\s]+", text):
+            d = (chunk or "").strip()
+            if not d:
+                continue
+            if d.lower() in ("auto", "default", "随机", "自动"):
+                continue
+            if d not in parts:
+                parts.append(d)
+        return parts
+
     def _resolve_mail_domain(self) -> Optional[str]:
-        """返回要使用的邮箱后缀；auto/空 则 None（由服务端默认）"""
-        d = (self.mail_domain or os.getenv("FREEMAIL_DOMAIN") or "").strip()
-        if not d or d.lower() == "auto":
+        """
+        返回要使用的邮箱后缀；auto/空 则 None（由服务端默认）。
+        多域名时 round-robin 轮换。
+        """
+        pool = list(self._mail_domain_pool or [])
+        if not pool:
+            d = (self.mail_domain or os.getenv("FREEMAIL_DOMAIN") or "").strip()
+            pool = self._parse_mail_domain_pool(d)
+            self._mail_domain_pool = pool
+        if not pool:
             return None
-        return d
+        if len(pool) == 1:
+            return pool[0]
+        with EmailService._domain_rr_lock:
+            idx = EmailService._domain_rr_idx % len(pool)
+            EmailService._domain_rr_idx = idx + 1
+            return pool[idx]
 
     def _create_cf_temp(self):
         try:
