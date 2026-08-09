@@ -82,7 +82,7 @@ _ACTION_CACHE_TTL = int(os.environ.get("GROK_ACTION_CACHE_TTL", str(30 * 60)))  
 # 注册路径：
 #   same_session = 同页 castle mint + 页内 fetch（CLEAN 主路径，默认）
 #   protocol     = 旧混合协议（Camoufox 拆会话 mint + curl signup，易 CASTLE deny）
-_REGISTER_MODE_DEFAULT = "same_session"
+_REGISTER_MODE_DEFAULT = "protocol"
 _VALID_REGISTER_MODES = ("same_session", "protocol", "legacy", "hybrid")
 
 
@@ -2088,7 +2088,7 @@ class RegisterEngine:
                     "id": it.get("id"),
                     "email": it.get("email"),
                     "sso_preview": it.get("sso_preview"),
-                    "sso": bool(it.get("sso")),  # 仅布尔，表示可导入
+                    "sso": it.get("sso") or "",  # 完整 SSO，供页面复制/测试
                     "has_token": is_auth_token_usable(it.get("auth_token")),
                     "nsfw": it.get("nsfw"),
                     "clean": it.get("clean"),
@@ -2258,7 +2258,8 @@ class RegisterEngine:
         return True
 
     def send_email_code_grpc(self, session, email, castle_request_token: Optional[str] = None):
-        """协议发码。可选带 castle_request_token（field 3）。"""
+        """协议发码。可选带 castle_request_token（field 3）。
+        返回 (ok, 友好失败原因)；ok=True 时 reason 为空串。"""
         url = f"{self.site_url}/auth_mgmt.AuthManagement/CreateEmailValidationCode"
         data = encode_create_email_validation_code(email, castle_request_token)
         headers = {
@@ -2270,13 +2271,17 @@ class RegisterEngine:
         }
         try:
             res = session.post(url, data=data, headers=headers, timeout=15)
-            # grpc-web: HTTP 200 + body trailer grpc-status:0 也算成功；
-            # 部分失败会在 header 带 grpc-status。
             if res.status_code != 200:
-                return False
+                return False, f"HTTP {res.status_code}（页面/服务异常）"
             gs = res.headers.get("grpc-status") or res.headers.get("Grpc-Status")
+            gm = res.headers.get("grpc-message") or res.headers.get("Grpc-Message")
+            if gm:
+                try:
+                    gm = urllib.parse.unquote(gm)
+                except Exception:
+                    pass
             if gs is not None and str(gs) not in ("0", ""):
-                return False
+                return False, self._friendly_grpc_error(gs, gm)
             body = res.content or b""
             if b"grpc-status:" in body and b"grpc-status:0" not in body:
                 # trailer 非 0
@@ -2286,11 +2291,33 @@ class RegisterEngine:
                         # 粗判：出现 status 且不是 0
                         text = body.decode("latin1", errors="replace")
                         if "grpc-status:0" not in text:
-                            return False
-            return True
+                            trailer_gs = re.search(r"grpc-status:\s*(\d+)", text)
+                            trailer_gm = re.search(r"grpc-message:\s*(.+)", text)
+                            return False, self._friendly_grpc_error(
+                                trailer_gs.group(1) if trailer_gs else "",
+                                (trailer_gm.group(1).strip() if trailer_gm else ""),
+                            )
+            return True, ""
         except Exception as e:
             self.log(f"{email} 发送验证码异常: {e}", "error")
-            return False
+            return False, f"网络/请求异常: {e}"
+
+    def _friendly_grpc_error(self, gs: str, gm: str = "") -> str:
+        """把 grpc-status / grpc-message 转成面向用户的友好提示。"""
+        low = (gm or "").lower()
+        if gs in ("8", "14") and ("rate" in low or "too many" in low or "validation codes" in low):
+            return "发码被限流：x.ai 认为该邮箱发码过于频繁，请更换邮箱或稍等片刻再试"
+        if gs in ("8", "14"):
+            return "服务繁忙或已被限流（grpc-status=8），建议更换邮箱稍后再试"
+        if gs in ("3",):
+            return "邮箱格式可能不受支持，请更换有效邮箱"
+        if gs in ("5",):
+            return "邮箱不存在或不可用（5 NOT_FOUND），请更换邮箱"
+        if gs in ("16",):
+            return "未认证：会话无效，建议重启任务"
+        if gm:
+            return f"服务端拒绝：{gm}"
+        return f"服务端拒绝（grpc-status={gs or '未知'}）"
 
     def verify_email_code_grpc(self, session, email, code):
         url = f"{self.site_url}/auth_mgmt.AuthManagement/VerifyEmailValidationCode"
@@ -3110,7 +3137,7 @@ class RegisterEngine:
                 def _ts_prewarm() -> None:
                     try:
                         task_id = turnstile_service.create_task(
-                            self.site_url, site_key, stop_event=self.stop_event
+                            self.site_url + "/sign-up", site_key, stop_event=self.stop_event
                         )
                         tok = turnstile_service.get_response(
                             task_id, stop_event=self.stop_event
@@ -3198,7 +3225,7 @@ class RegisterEngine:
                         ts_pre["used"] = True
                         return tok
                     task_id = turnstile_service.create_task(
-                        self.site_url, sk or site_key, stop_event=self.stop_event
+                        self.site_url + "/sign-up", sk or site_key, stop_event=self.stop_event
                     )
                     return turnstile_service.get_response(
                         task_id, stop_event=self.stop_event
@@ -3563,16 +3590,25 @@ class RegisterEngine:
                         current_email = None
                         return
 
-                    if not self.send_email_code_grpc(
+                    code_ok, code_reason = self.send_email_code_grpc(
                         session, email, castle_request_token=castle_token
-                    ):
+                    )
+                    if not code_ok:
                         self._fail_account(
-                            email_service, email, f"{email} 发送邮箱验证码失败"
+                            email_service,
+                            email,
+                            f"{email} 发送邮箱验证码失败：{code_reason or '未知原因'}",
                         )
                         current_email = None
                         continue
 
-                    self.log(f"{email} 已请求邮箱验证码，等待收件…", "info")
+                    if getattr(email_service, "manual_email", ""):
+                        self.log(
+                            f"{email} 已请求邮箱验证码，等待人工提交流程：请把收到的验证码粘贴到「提交验证码」输入框…",
+                            "warn",
+                        )
+                    else:
+                        self.log(f"{email} 已请求邮箱验证码，等待收件…", "info")
                     verify_code = email_service.fetch_verification_code(
                         email, stop_event=self.stop_event
                     )

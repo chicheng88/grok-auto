@@ -36,10 +36,10 @@ def new_conversion_id() -> str:
 def castle_mint_enabled() -> bool:
     """
     GROK_CASTLE_MINT:
-      1/true/on  → try browser mint (default)
-      0/false/off → skip browser, still send conversionId only
+      1/true/on  → try browser mint
+      0/false/off → skip browser, still send conversionId only (default)
     """
-    raw = (os.getenv("GROK_CASTLE_MINT") or "1").strip().lower()
+    raw = (os.getenv("GROK_CASTLE_MINT") or "0").strip().lower()
     return raw not in ("0", "false", "off", "no", "none")
 
 

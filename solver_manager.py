@@ -24,7 +24,7 @@ PID_FILE = BASE_DIR / "logs" / "turnstile_solver.pid"
 LOG_FILE = BASE_DIR / "logs" / "turnstile_solver.log"
 STATE_FILE = BASE_DIR / "logs" / "turnstile_solver.state.json"
 
-DEFAULT_SOLVER_URL = "http://127.0.0.1:5072"
+DEFAULT_SOLVER_URL = "http://127.0.0.1:5074"
 DEFAULT_BROWSER = "camoufox"
 DEFAULT_THREADS = 4
 
@@ -54,10 +54,16 @@ def load_solver_config() -> dict[str, Any]:
     threads = max(1, min(threads, 16))
     host = os.getenv("SOLVER_HOST", "127.0.0.1").strip() or "127.0.0.1"
     try:
-        port = int(os.getenv("SOLVER_PORT") or _port_from_url(url) or 5072)
+        port = int(os.getenv("SOLVER_PORT") or _port_from_url(url) or 5074)
     except ValueError:
-        port = 5072
+        port = 5074
     debug = (os.getenv("SOLVER_DEBUG") or "1").strip() not in ("0", "false", "False")
+    # HEADLESS 崩溃时（如 SWGL/驱动异常）可切窗口模式：SOLVER_HEADLESS=0
+    headless = (os.getenv("SOLVER_HEADLESS") or "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
     return {
         "url": url,
         "browser": browser,
@@ -65,12 +71,13 @@ def load_solver_config() -> dict[str, Any]:
         "host": host,
         "port": port,
         "debug": debug,
+        "headless": headless,
     }
 
 
 def _port_from_url(url: str) -> Optional[int]:
     try:
-        # http://127.0.0.1:5072
+        # http://127.0.0.1:5074
         part = url.split("://", 1)[-1]
         if ":" in part:
             return int(part.rsplit(":", 1)[-1].split("/")[0])
@@ -251,7 +258,7 @@ def status(force: bool = False, http_timeout: float = 0.8) -> dict[str, Any]:
 
     cfg = load_solver_config()
     host = cfg["host"] or "127.0.0.1"
-    port = int(cfg["port"] or 5072)
+    port = int(cfg["port"] or 5074)
 
     pid = _read_pid()
     running = is_pid_running(pid)
@@ -437,7 +444,7 @@ def start_watchdog(
     interval: float = 8.0,
 ) -> dict[str, Any]:
     """
-    后台看门狗：任务运行期间周期性检测 5072，挂了就自动拉起。
+    后台看门狗：任务运行期间周期性检测 5074，挂了就自动拉起。
     可重复调用（会更新 log_fn / interval）。
     """
     global _watchdog_thread, _watchdog_log, _watchdog_interval
@@ -536,6 +543,30 @@ def _watchdog_loop() -> None:
             break
 
 
+
+def _cleanup_camoufox_stale() -> None:
+    """清理 疑似死尸的 camoufox 进程和 profile 锁，避免“already running, not responding”。"""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/IM", "camoufox.exe", "/F"],
+                capture_output=True,
+                text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=10,
+            )
+    except Exception:
+        pass
+    import glob
+    try:
+        for lock in glob.glob(os.path.join(os.path.expanduser("~"), ".camoufox_persist", "*", "parent.lock")):
+            try:
+                os.remove(lock)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 def start(wait_ready: bool = True, timeout: float = 90.0) -> dict[str, Any]:
     # 外部已可能持锁；此处再拿锁保证 CLI/UI 并发安全
     acquired = _START_LOCK.acquire(blocking=True)
@@ -577,10 +608,11 @@ def _start_unlocked(wait_ready: bool = True, timeout: float = 90.0) -> dict[str,
     if old_pid and not is_pid_running(old_pid) and not port_is_open(cfg["host"], int(cfg["port"])):
         _clear_pid()
 
+    _cleanup_camoufox_stale()
     _ensure_dirs()
     cmd = [
         sys.executable,
-        str(BASE_DIR / "api_solver.py"),
+        str(BASE_DIR / "api_solver_p2.py"),
         "--browser_type",
         cfg["browser"],
         "--thread",
@@ -592,6 +624,8 @@ def _start_unlocked(wait_ready: bool = True, timeout: float = 90.0) -> dict[str,
     ]
     if cfg["debug"]:
         cmd.append("--debug")
+    if not cfg["headless"]:
+        cmd.append("--no-headless")
 
     log_f = open(LOG_FILE, "a", encoding="utf-8", errors="ignore")
     log_f.write("\n" + "=" * 60 + f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] START {' '.join(cmd)}\n")
@@ -760,3 +794,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

@@ -1,11 +1,15 @@
 # Grok 批量注册工具
 
-Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Castle 同页 mint，以及 HTTP 导入 sub2api。
+Web 控制台 + 注册引擎，支持临时邮箱、Turnstile 本地 Solver、Castle 同页 mint，以及 HTTP 导入 sub2api。
+
+> 本项目在 [huslx/grokzhuce](https://github.com/huslx/grokzhuce) 基础上修改扩展，
+> 核心协议路径（grpc-web 发码/验码、RSC sign-up、Turnstile、Castle mint）参照其实现；
+> 改动与新增见文末「参考与致谢」。
 
 ## 功能
 
-- 同页 same-session 注册（Castle mint + 页内 fetch，默认 CLEAN 主路径）
-- 临时邮箱自动建邮 / 收码（[cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)）
+- 纯协议注册路径（grpc-web 发码/验码 + RSC `/sign-up`，默认，不带 Castle token）
+- 临时邮箱自动建邮 / 收码（[cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)），未部署 Worker 时可用手动模式（`MANUAL_EMAIL`）
 - **邮箱后缀多选**：建邮时 round-robin 轮换多个域名
 - 本地 Camoufox Turnstile Solver（也可接 YesCaptcha）
 - 多线程并发；主流程 / Risk·Token·NSFW 双栏日志
@@ -24,6 +28,7 @@ Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Cas
 ├── grok.py                     # 注册引擎 + CLI
 ├── solver_manager.py           # Turnstile Solver 进程管理
 ├── api_solver.py               # 本地 Turnstile Solver
+├── api_solver_p2.py            # Solver（页面持久化版，默认启动，端口 5074）
 ├── setup_solver.py             # 安装 Solver / camoufox 依赖
 ├── TurnstileSolver.bat         # Windows 一键启动 Solver
 ├── import_batch_once.py        # 从 keys 文本批量导入 sub2api
@@ -72,9 +77,12 @@ cp .env.example .env
 | `FREEMAIL_DOMAIN` | 邮箱后缀：`auto` / 单域名 / 多域名逗号分隔（轮换） | `auto` |
 | `FREEMAIL_API_STYLE` | `auto` / `cf_temp` / `freemail` | `auto` |
 | `YESCAPTCHA_KEY` | 有则走 YesCaptcha；空则本地 Solver | 空 |
-| `SOLVER_URL` | 本地 Solver 地址 | `http://127.0.0.1:5072` |
+| `SOLVER_URL` | 本地 Solver 地址 | `http://127.0.0.1:5074` |
 | `SOLVER_BROWSER` | `camoufox` / `chromium` | `camoufox` |
 | `SOLVER_THREADS` | Solver 浏览器线程 | `4` |
+| `GROK_CASTLE_MINT` | `1`=开浏览器 Castle mint；默认关闭 | `0` |
+| `MANUAL_EMAIL` | 手动模式邮箱（跳过 Worker 建邮/删邮） | 空 |
+| `MANUAL_CODE` | 手动模式验证码（只消费一次）；不设则轮询 `logs/manual_code.txt` | 空 |
 | `UI_HOST` / `UI_PORT` | Web 监听 | `127.0.0.1` / `3333` |
 | `GROK_PROXY` | 单条注册代理；空=直连 | 空 |
 | `GROK_PROXY_LIST` | 代理池（分号/换行分隔，优先于单条） | 空 |
@@ -169,8 +177,22 @@ python import_batch_once.py keys/your_sso.txt
 
 | 模式 | 说明 |
 |------|------|
-| `same_session`（默认） | 同页 Castle mint + 页内发码/验码/signup，CLEAN 主路径 |
-| `protocol` / `legacy` | 兼容旧路径，易被 Castle deny，不推荐 |
+| `protocol`（默认） | 纯协议路径：grpc-web 发码/验码 + RSC `/sign-up`；发码注册均不携带 Castle token |
+| `same_session` | 同页交互注册（页内发码/验码/signup），需浏览器；`CASTLE_MODE` 默认 `skip` |
+
+`GROK_REGISTER_MODE` 环境变量可覆盖默认路径；`GROK_CASTLE_MINT=1` / `CASTLE_MODE=camoufox` 可重新开启 Castle mint（新增浏览器耗时，短 token 会被服务端判 invalid_token，默认关闭）。
+
+## 手动模式（不依赖邮箱 Worker）
+
+未部署 cloudflare_temp_email Worker 时仍可注册：
+
+```bash
+set MANUAL_EMAIL=your_temp@example.com
+python grok.py          # 路径选 protocol、并发 1、数量 1
+```
+
+发码后把收到的验证码写入 `logs\manual_code.txt`（或重跑时设 `MANUAL_CODE`），脚本读到即继续；
+等待时长用 `MANUAL_CODE_TIMEOUT`（默认 600s）控制。手动模式下不会调用 Worker 建邮/删邮。
 
 ## 注意事项
 
@@ -178,3 +200,12 @@ python import_batch_once.py keys/your_sso.txt
 - 仓库不包含真实 `.env`、代理账号、邮箱密码、keys/logs。
 - 推送前请确认工作区无个人域名、代理凭证与内网地址。
 - 示例配置一律用占位符（`your-worker.workers.dev`、`admin@example.com` 等）。
+
+## 参考与致谢
+
+- [huslx/grokzhuce](https://github.com/huslx/grokzhuce) —— 本项目的主体代码与实现思路源自该仓库（协议还原、Turnstile Solver、注册引擎、Web 控制台）；本仓库在其基础上改动：
+  - 注册路径默认改为纯协议 `protocol`（grpc-web 发码/验码 + RSC `/sign-up`），默认不启用 Castle mint
+  - 新增手动模式（`MANUAL_EMAIL` / `MANUAL_CODE` / `logs\manual_code.txt`），无需邮箱 Worker
+  - 本地 Turnstile Solver 默认 `127.0.0.1:5074`，使用页面持久化版 `api_solver_p2.py`
+- [dreamhunter2333/cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email) —— 临时邮箱 Worker
+- 仅供学习参考，请勿用于违反服务条款的用途。

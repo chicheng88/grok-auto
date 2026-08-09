@@ -35,7 +35,7 @@ class CastleService:
     def __init__(self):
         import os
 
-        self.mode = (os.getenv("CASTLE_MODE") or "camoufox").strip().lower()
+        self.mode = (os.getenv("CASTLE_MODE") or "skip").strip().lower()
         self.min_len = MIN_CASTLE_LEN
         self.timeout_s = int(os.getenv("CASTLE_TIMEOUT_S") or "120")
         self.last_error = ""

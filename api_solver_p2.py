@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 import time
 import uuid
@@ -7,6 +7,7 @@ import logging
 import asyncio
 from typing import Optional, Union
 import argparse
+from pathlib import Path
 
 # Windows 控制台 GBK 下避免 emoji / rich 编码崩溃
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
@@ -18,6 +19,10 @@ try:
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
+
+
+if Path(__file__).resolve().parent not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from quart import Quart, request, jsonify
 from camoufox.async_api import AsyncCamoufox
@@ -188,7 +193,16 @@ class TurnstileAPIServer:
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
             playwright = await async_playwright().start()
         elif self.browser_type == "camoufox":
-            camoufox = AsyncCamoufox(headless=self.headless)
+            camoufox = AsyncCamoufox(
+                headless=self.headless,
+                persistent_context=True,
+                user_data_dir=r"C:\Users\G\.camoufox_persist\grok_reg",
+                humanize=True,
+                os=("windows",),
+                locale="en-US",
+                block_webrtc=True,
+                block_webgl=False,
+            )
 
         browser_configs = []
         for _ in range(self.thread_count):
@@ -594,7 +608,7 @@ class TurnstileAPIServer:
         index, browser, browser_config = await self.browser_pool.get()
         
         try:
-            if hasattr(browser, 'is_connected') and not browser.is_connected():
+            if getattr(browser, 'alive', True) is False:# guard ok
                 if self.debug:
                     logger.warning(f"Browser {index}: Browser disconnected, skipping")
                 await self.browser_pool.put((index, browser, browser_config))
@@ -648,7 +662,7 @@ class TurnstileAPIServer:
                                 'sec-ch-ua': browser_config['sec_ch_ua']
                             }
                         
-                        context = await browser.new_context(**context_options)
+                        context = browser  # P2: persistent context (no new_context)
                     except ValueError:
                         raise ValueError(f"Invalid proxy format: {proxy}")
                 else:
@@ -671,7 +685,7 @@ class TurnstileAPIServer:
                                 'sec-ch-ua': browser_config['sec_ch_ua']
                             }
                         
-                        context = await browser.new_context(**context_options)
+                        context = browser  # P2: persistent context (no new_context)
                     elif len(parts) == 3:
                         if self.debug:
                             logger.debug(f"Browser {index}: Creating context with proxy {proxy}")
@@ -685,7 +699,7 @@ class TurnstileAPIServer:
                                 'sec-ch-ua': browser_config['sec_ch_ua']
                             }
                         
-                        context = await browser.new_context(**context_options)
+                        context = browser  # P2: persistent context (no new_context)
                     else:
                         raise ValueError(f"Invalid proxy format: {proxy}")
             else:
@@ -698,7 +712,7 @@ class TurnstileAPIServer:
                         'sec-ch-ua': browser_config['sec_ch_ua']
                     }
                 
-                context = await browser.new_context(**context_options)
+                context = browser  # P2: persistent context (no new_context)
         else:
             context_options = {"user_agent": browser_config['useragent']}
             
@@ -707,7 +721,7 @@ class TurnstileAPIServer:
                     'sec-ch-ua': browser_config['sec_ch_ua']
                 }
             
-            context = await browser.new_context(**context_options)
+            context = browser  # P2: persistent context (no new_context)
 
         page = await context.new_page()
         
@@ -886,6 +900,28 @@ class TurnstileAPIServer:
                     wait_time = min(0.08 + (attempt * 0.02), 0.45)
                     await asyncio.sleep(wait_time)
 
+                    if os.getenv("SOLVER_DEBUG_SHOT") == "1" and attempt in (6, 30, 50):
+                        try:
+                            shots = Path("logs/shots")
+                            shots.mkdir(parents=True, exist_ok=True)
+                            name = f"{task_id[:8]}_a{attempt}"
+                            await page.screenshot(path=str(shots / f"{name}.png"))
+                            frames = []
+                            for fr in page.frames:
+                                try:
+                                    t = await fr.title()
+                                    u = fr.url
+                                    tags = await fr.locator("input,button,.cf-turnstile,iframe").count()
+                                    frames.append(f"{fr.name}:{u[:70]}[{t[:20]}](els:{tags})")
+                                except Exception:
+                                    pass
+                            (shots / f"{name}_frames.txt").write_text("\n".join(frames), encoding="utf-8")
+                            if self.debug:
+                                logger.debug(f"Browser {index}: DEBUG SHOT {name}")
+                        except Exception as e:
+                            if self.debug:
+                                logger.debug(f"Browser {index}: shot failed: {e}")
+
                     if self.debug and attempt % 5 == 0:
                         logger.debug(f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - Waiting for token (clicks: {click_count}/{max_clicks})")
 
@@ -905,18 +941,17 @@ class TurnstileAPIServer:
                 logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
         finally:
             if self.debug:
-                logger.debug(f"Browser {index}: Closing browser context and cleaning up")
-            
-            try:
-                await context.close()
+                logger.debug(f"Browser {index}: P2 keep-alive（持久 context 不关闭）")
+            try:  # noqa: B012
+                # 持久化 context：整个服务生命周期保活，只在任务间轮换 page
                 if self.debug:
-                    logger.debug(f"Browser {index}: Context closed successfully")
+                    logger.debug(f"Browser {index}: Context kept alive")
             except Exception as e:
                 if self.debug:
-                    logger.warning(f"Browser {index}: Error closing context: {str(e)}")
-            
+                    logger.warning(f"Browser {index}: Error keeping context: {str(e)}")
+
             try:
-                if hasattr(browser, 'is_connected') and browser.is_connected():
+                if True:  # persistent alive: keep pool
                     await self.browser_pool.put((index, browser, browser_config))
                     if self.debug:
                         logger.debug(f"Browser {index}: Browser returned to pool")

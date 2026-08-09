@@ -1,4 +1,4 @@
-"""
+﻿"""
 Turnstile 验证服务
 """
 import os
@@ -15,7 +15,7 @@ class TurnstileService:
     def __init__(self, solver_url=None):
         self.yescaptcha_key = os.getenv("YESCAPTCHA_KEY", "").strip()
         self.solver_url = (
-            (solver_url or os.getenv("SOLVER_URL") or "http://127.0.0.1:5072")
+            (solver_url or os.getenv("SOLVER_URL") or "http://127.0.0.1:5074")
             .strip()
             .rstrip("/")
         )
@@ -140,7 +140,7 @@ class TurnstileService:
                     raise
                 except Exception as revive_err:
                     raise Exception(
-                        f"无法连接本地 Solver {self.solver_url}（5072 未监听），"
+                        f"无法连接本地 Solver {self.solver_url}（5074 未监听），"
                         f"自动恢复失败: {revive_err}"
                     ) from e
                 continue
@@ -156,7 +156,7 @@ class TurnstileService:
                     f" 原始错误: {e}"
                 ) from e
         raise Exception(
-            f"无法连接本地 Solver {self.solver_url}（WinError 10061 表示 5072 未监听）。"
+            f"无法连接本地 Solver {self.solver_url}（WinError 10061 表示 5074 未监听）。"
             f" 原始错误: {last_err}"
         )
 

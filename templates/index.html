@@ -205,8 +205,13 @@
       0%, 100% { opacity: 1; transform: scale(1); }
       50% { opacity: .5; transform: scale(.85); }
     }
+    @keyframes manual-flash-kf {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(244, 63, 94, 0); }
+      50% { box-shadow: 0 0 0 4px rgba(244, 63, 94, .35); }
+    }
+    .manual-flash { animation: manual-flash-kf 1.1s ease-in-out 3; }
     .pulse-live { animation: pulse-dot 1.4s ease-in-out infinite; }
-    #logBox, #postLogBox, #successList, #keysList { scrollbar-width: thin; scrollbar-color: #d5cdb8 transparent; }
+    #logBox, #postLogBox, #successList, #keysList, #leftTabBody { scrollbar-width: thin; scrollbar-color: #d5cdb8 transparent; }
     /* 日志双栏：不靠 Tailwind xl 断点（很多窗口 <1280 时 col-span 不生效，宽死活不变） */
     .log-split {
       display: grid;
@@ -360,15 +365,18 @@
       <!-- 左控制 / 右日志：大屏日志区更宽，外层由 max-w-[1680px] 控宽而非 7xl -->
       <div class="grid lg:grid-cols-12 gap-5 min-w-0">
         <!-- Left column -->
-        <section class="lg:col-span-4 space-y-4 min-w-0">
+        <section class="lg:col-span-4 min-w-0 flex flex-col gap-4">
           <!-- Tabs: run / config -->
-          <div class="panel rounded-2xl overflow-hidden">
-            <div class="flex gap-1 p-1.5 bg-paper-100 border-b border-ink-900/5">
+          <div class="panel rounded-2xl overflow-hidden flex flex-col flex-1 min-h-0">
+            <div class="flex gap-1 p-1.5 bg-paper-100 border-b border-ink-900/5 shrink-0">
               <button type="button" data-tab="run" class="tab-btn active flex-1 rounded-xl px-3 py-2 text-sm text-ink-700/70">运行</button>
               <button type="button" data-tab="config" class="tab-btn flex-1 rounded-xl px-3 py-2 text-sm text-ink-700/70">配置</button>
               <button type="button" data-tab="proxy" class="tab-btn flex-1 rounded-xl px-3 py-2 text-sm text-ink-700/70">代理</button>
               <button type="button" data-tab="keys" class="tab-btn flex-1 rounded-xl px-3 py-2 text-sm text-ink-700/70">Keys</button>
+              <button type="button" data-tab="test" class="tab-btn flex-1 rounded-xl px-3 py-2 text-sm text-ink-700/70">测试</button>
             </div>
+
+            <div id="leftTabBody" class="flex-1 min-h-0 overflow-y-auto flex flex-col">
 
             <!-- RUN PANEL -->
             <div id="tab-run" class="p-5 space-y-4">
@@ -378,14 +386,42 @@
                   <label class="field-label" for="registerMode">注册路径</label>
                   <div class="c-select" data-select="registerMode">
                     <button type="button" class="c-select-btn" id="registerModeBtn" aria-haspopup="listbox">
-                      <span class="value">同会话 CLEAN（推荐）</span>
+                      <span class="value">纯协议（grpc-web + RSC，默认）</span>
                       <svg class="chev" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.17l3.71-3.94a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/></svg>
                     </button>
                     <div class="c-select-menu" role="listbox"></div>
-                    <input type="hidden" id="registerMode" name="registerMode" value="same_session" />
+                    <input type="hidden" id="registerMode" name="registerMode" value="protocol" />
                   </div>
-                  <p class="mt-1.5 text-[11px] text-ink-700/50">同会话：页内 mint castle + fetch（已验证 CLEAN）。旧协议易 CASTLE deny。</p>
+                  <p class="mt-1.5 text-[11px] text-ink-700/50">protocol：纯协议发码/验码/signup（默认，不带 Castle）。same_session 需浏览器。</p>
                 </div>
+
+                <!-- 邮箱来源（Worker 自动 / 手动粘贴） -->
+                <div class="rounded-xl border border-ink-900/8 bg-white p-4 space-y-3">
+                  <div class="flex items-center gap-4 text-sm">
+                    <span class="text-xs font-semibold text-ink-700/60">邮箱来源</span>
+                    <label class="inline-flex items-center gap-1.5 font-mono text-xs cursor-pointer">
+                      <input type="radio" name="mailSrc" value="worker" checked class="rounded border-brand-300 text-brand-500 focus:ring-brand-500/30" />
+                      Worker 自动
+                    </label>
+                    <label class="inline-flex items-center gap-1.5 font-mono text-xs cursor-pointer">
+                      <input type="radio" name="mailSrc" value="manual" class="rounded border-brand-300 text-brand-500 focus:ring-brand-500/30" />
+                      手动（粘贴邮箱 + 验证码）
+                    </label>
+                  </div>
+                  <div id="manualMailBlock" class="hidden space-y-2 rounded-xl border border-brand-500/25 bg-brand-500/5 p-3 transition-colors">
+                    <div>
+                      <label class="field-label" for="manualEmail">手动邮箱（每行一个，按粘贴数量逐个注册）</label>
+                      <textarea id="manualEmail" rows="3" placeholder="a@kikru.xyz&#10;b@kikru.xyz" class="field font-mono text-xs resize-y" autocomplete="off" spellcheck="false"></textarea>
+                    </div>
+                    <div class="grid grid-cols-2 gap-2">
+                      <input id="manualCode" placeholder="验证码（提示后粘贴，如 ABC-123）" class="field font-mono text-xs" autocomplete="off" spellcheck="false" />
+                      <button type="button" id="btnSubmitManualCode" class="btn btn-primary text-xs py-1.5">提交验证码</button>
+                    </div>
+                    <span id="manualMailHint" class="text-[11px] font-mono text-ink-700/55 min-h-[1rem]">贴在左侧邮箱列表 → 启动 → 每个邮箱到「等待验证码」时提示，把收到的码粘贴提交</span>
+                  </div>
+                </div>
+
+                <div id="autoRunConfig">
                 <div>
                   <label class="field-label" for="workers">并发线程</label>
                   <div class="c-select" data-select="workers">
@@ -411,6 +447,7 @@
                   <input id="targetCustom" type="number" min="1" max="100000" placeholder="自定义数量，例如 25"
                          class="field mt-2" />
                 </div>
+                </div>
                 <div class="grid grid-cols-2 gap-3 pt-1">
                   <button id="btnStart" type="submit" class="btn btn-primary">启动注册</button>
                   <button id="btnStop" type="button" class="btn btn-danger" disabled>停止</button>
@@ -418,7 +455,8 @@
               </form>
               <p id="formMessage" class="text-xs font-mono min-h-[1.1rem] text-ink-700/50"></p>
 
-              <div class="rounded-xl bg-paper-100 border border-ink-900/5 p-3 text-xs text-ink-700/70 space-y-1.5">
+              <!-- NOTES -->
+              <div id="notesPanel" class="rounded-xl bg-paper-100 border border-ink-900/5 p-3 text-xs text-ink-700/70 space-y-1.5">
                 <div class="flex justify-between gap-2"><span>Worker</span><span id="envWorker" class="font-mono text-ink-800 truncate max-w-[58%] text-right">—</span></div>
                 <div class="flex justify-between gap-2"><span>邮箱后缀</span><span id="envMailDomain" class="font-mono text-ink-800">—</span></div>
                 <div class="flex justify-between gap-2"><span>Token</span><span id="envToken" class="font-mono text-ink-800">—</span></div>
@@ -430,7 +468,7 @@
               </div>
 
               <!-- Turnstile Solver 控制 -->
-              <div class="rounded-xl border border-ink-900/8 bg-white p-4 space-y-3">
+              <div id="solverPanel" class="rounded-xl border border-ink-900/8 bg-white p-4 space-y-3">
                 <div class="flex items-start justify-between gap-3">
                   <div>
                     <h3 class="font-display font-semibold text-ink-900 text-sm">Turnstile Solver</h3>
@@ -656,6 +694,36 @@
               <ul id="keysList" class="space-y-2 max-h-80 overflow-y-auto text-xs font-mono">
                 <li class="text-ink-700/50">暂无文件</li>
               </ul>
+            </div>
+
+            <!-- TEST PANEL -->
+            <div id="tab-test" class="p-5 space-y-3 hidden">
+              <h2 class="font-display font-semibold text-ink-900">Grok 4.5 功能测试</h2>
+              <div>
+                <label class="field-label" for="testSso" id="testSsoWrap">SSO（成功列表点「复制」后粘贴，或手贴 email----sso----sso_rw 一行）</label>
+                <textarea id="testSso" class="field font-mono text-xs" rows="3" placeholder="粘贴 SSO…"></textarea>
+              </div>
+              <div class="grid grid-cols-2 gap-3">
+                <div>
+                  <label class="field-label" for="testMsg">测试消息</label>
+                  <input id="testMsg" class="field font-mono text-sm" value="hi" />
+                </div>
+                <div>
+                  <label class="field-label" for="testModel">模型</label>
+                  <input id="testModel" class="field font-mono text-sm" value="grok-4.5" />
+                </div>
+              </div>
+              <label class="inline-flex items-center gap-2 text-xs text-ink-700/70 font-mono cursor-pointer select-none">
+                <input id="testExchange" type="checkbox" checked class="rounded border-brand-300 text-brand-500 focus:ring-brand-500/30" />
+                device flow 自动换取 token（每次测试前自动换最新 access token）
+              </label>
+              <div class="flex items-center gap-3">
+                <button id="btnGrokTest" type="button" class="btn btn-brand text-sm">开始测试</button>
+                <span id="testHint" class="text-xs font-mono min-h-[1.1rem]"></span>
+              </div>
+              <pre id="testResult" class="text-[11px] font-mono bg-paper-50 border border-ink-900/5 rounded-xl p-3 max-h-80 overflow-y-auto whitespace-pre-wrap hidden"></pre>
+            </div>
+
             </div>
           </div>
         </section>
@@ -890,10 +958,10 @@
     const registerModeSelect = initSelect(
       document.querySelector('[data-select="registerMode"]'),
       [
-        { value: 'same_session', label: '同会话 CLEAN（推荐）' },
-        { value: 'protocol', label: '旧混合协议（易 deny）' },
+        { value: 'protocol', label: '纯协议（grpc-web + RSC，默认）' },
+        { value: 'same_session', label: '同会话 CLEAN（需浏览器）' },
       ],
-      'same_session'
+      'protocol'
     );
 
     const workerSelect = initSelect(
@@ -1041,7 +1109,7 @@
       btn.addEventListener('click', () => {
         document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
-        ['run', 'config', 'proxy', 'keys'].forEach(name => {
+        ['run', 'config', 'proxy', 'keys', 'test'].forEach(name => {
           const el = $('tab-' + name);
           if (el) el.classList.toggle('hidden', btn.dataset.tab !== name);
         });
@@ -1052,6 +1120,75 @@
     });
 
     /* ---------- Helpers ---------- */
+    async function copyText(text) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch (e) {
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          const ok = document.execCommand('copy');
+          document.body.removeChild(ta);
+          return ok;
+        } catch (e2) {
+          return false;
+        }
+      }
+    }
+
+    async function runGrokTest() {
+      const btn = $('btnGrokTest');
+      const sso = ($('testSso') || {}).value ? $('testSso').value.trim() : '';
+      if (!sso) {
+        setMessage($('testHint'), '请先粘贴 SSO（成功列表点「复制」）', false);
+        return;
+      }
+      const exchange = !$('testExchange') || $('testExchange').checked;
+      const payload = {
+        sso,
+        exchange,
+        message: ($('testMsg') || {}).value ? $('testMsg').value.trim() : 'hi',
+        model: ($('testModel') || {}).value ? $('testModel').value.trim() : 'grok-4.5',
+      };
+      btn.disabled = true;
+      setMessage($('testHint'), exchange ? '换取 token 并测试中…（约 1 分钟）' : '测试中…', true);
+      const box = $('testResult');
+      box.classList.remove('hidden');
+      box.textContent = '...';
+      try {
+        const data = await fetchJSON('/api/grok-test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (data.ok) {
+          setMessage($('testHint'), `✓ 测试通过（${data.elapsed_s}s, exit=${data.exit_code}）`, true);
+        } else {
+          setMessage($('testHint'), `✗ ${(data.error || '').slice(0, 120)}`, false);
+        }
+        const lines = [];
+        lines.push(`account:   ${data.account || '(未知)'}`);
+        lines.push(`model:     ${payload.model}`);
+        lines.push(`message:   ${payload.message}`);
+        lines.push(`exchange:  ${exchange}`);
+        if (data.models) lines.push(`models:    ${data.models.replace(/\n/g, ' ')}`);
+        lines.push(`elapsed:   ${data.elapsed_s}s | exit=${data.exit_code}`);
+        if (data.error) lines.push(`error:     ${data.error}`);
+        if (data.reply) lines.push(`\n---- reply ----\n${data.reply}`);
+        box.textContent = lines.join('\n');
+      } catch (e) {
+        setMessage($('testHint'), `请求失败: ${e.message || e}`, false);
+        box.textContent = String(e.message || e);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
     function setMessage(el, msg, ok = true) {
       el.textContent = msg || '';
       el.className = `text-xs font-mono min-h-[1.1rem] ${ok ? 'text-leaf-600' : 'text-rose-500'}`;
@@ -1108,12 +1245,37 @@
         box.appendChild(row);
         state[afterKey] = Math.max(state[afterKey], e.id || 0);
         added += 1;
+        // 手动模式：流程到「等待验证码」环节 → 突出提示用户粘贴提交
+        if (e.message && e.message.includes('请把收到的验证码粘贴到')) {
+          manualCodePrompt(e.message);
+        }
       }
       while (box.children.length > maxChildren) box.removeChild(box.firstChild);
       if (added && $('autoScroll') && $('autoScroll').checked) {
         box.scrollTop = box.scrollHeight;
       }
       return added;
+    }
+
+    let manualPromptEmail = '';
+    function manualCodePrompt(line) {
+      const block = $('manualMailBlock');
+      if (!block || block.classList.contains('hidden')) return;
+      const m = line ? line.match(/[\w.+-]+@[\w.-]+/) : null;
+      if (m) manualPromptEmail = m[0];
+      const input = $('manualCode');
+      const hint = $('manualMailHint');
+      if (hint) {
+        hint.textContent = manualPromptEmail
+          ? `请把「${manualPromptEmail}」收到的验证码粘贴到上方输入框 → 点「提交验证码」`
+          : '请把收到的验证码粘贴到上方输入框，然后点「提交验证码」';
+        hint.className = 'text-[11px] font-mono min-h-[1rem] text-rose-500 font-semibold';
+      }
+      if (input) input.classList.add('ring-2', 'ring-rose-400');
+      block.classList.remove('manual-flash');
+      void block.offsetWidth;
+      block.classList.add('manual-flash');
+      block.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
 
     function appendLogs(entries) {
@@ -1293,6 +1455,10 @@
               <div class="text-ink-700/35">${escapeHtml(it.time || '')}</div>
               <div class="flex items-center justify-end gap-2">
                 ${importedBadge}
+                <button type="button"
+                  class="btn-copy-sso text-[11px] font-semibold text-ink-700/60 hover:text-brand-600"
+                  data-sso="${escapeHtml(it.sso || '')}"
+                  ${it.sso ? '' : 'disabled'}>复制 SSO</button>
                 <button type="button"
                   class="btn-import-one text-[11px] font-semibold ${canImport ? 'text-brand-600 hover:underline' : 'text-ink-700/30 cursor-not-allowed'}"
                   data-id="${escapeHtml(it.id || '')}"
@@ -1584,7 +1750,7 @@
         $('cfgWorker').value = c.WORKER_DOMAIN || '';
         $('cfgToken').value = c.FREEMAIL_TOKEN || '';
         $('cfgYes').value = c.YESCAPTCHA_KEY || '';
-        $('cfgSolver').value = c.SOLVER_URL || 'http://127.0.0.1:5072';
+        $('cfgSolver').value = c.SOLVER_URL || 'http://127.0.0.1:5074';
         $('cfgSolverThreads').value = c.SOLVER_THREADS || '2';
         solverBrowserSelect._setValue(c.SOLVER_BROWSER || 'camoufox', true);
         $('cfgUiHost').value = c.UI_HOST || '127.0.0.1';
@@ -1604,6 +1770,16 @@
         const mode = c.YESCAPTCHA_KEY ? 'yescaptcha' : 'local';
         captchaSelect._setValue(mode, true);
         $('yesCaptchaBlock').classList.toggle('hidden', mode !== 'yescaptcha');
+
+        // 手动邮箱模式回填
+        if ($('manualEmail')) {
+          const manual = (c.MANUAL_EMAIL || '').trim();
+          if (manual) {
+            $('manualEmail').value = manual;
+            const radio = document.querySelector('input[name="mailSrc"][value="manual"]');
+            if (radio) { radio.checked = true; toggleMailSrc('manual'); }
+          }
+        }
 
         const savedDomain = (c.FREEMAIL_DOMAIN || 'auto').trim() || 'auto';
         const savedList = savedDomain.split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
@@ -1659,6 +1835,40 @@
       }
     }
 
+    function toggleMailSrc(mode) {
+      const block = $('manualMailBlock');
+      if (block) block.classList.toggle('hidden', mode !== 'manual');
+      // 手动：按粘贴邮箱数量执行，隐藏 并发/数量 配置
+      const autoCfg = $('autoRunConfig');
+      if (autoCfg) autoCfg.classList.toggle('hidden', mode === 'manual');
+    }
+
+    async function submitManualCode() {
+      const code = ($('manualCode') ? $('manualCode').value : '').trim();
+      const hint = $('manualMailHint');
+      if (!code) { hint.textContent = '验证码为空'; hint.className = 'text-[11px] font-mono min-h-[1rem] text-rose-500'; return; }
+      // 提示来自哪封邮箱，就把码写给它；未提示时走全局通道（旧版兼容）
+      const email = manualPromptEmail;
+      try {
+        const data = await fetchJSON('/api/manual-code', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code, email }),
+        });
+        hint.textContent = data.ok ? (data.message || '已提交') : '提交失败: ' + (data.error || '');
+        hint.className = 'text-[11px] font-mono min-h-[1rem] ' + (data.ok ? 'text-leaf-600' : 'text-rose-500');
+        if (data.ok) {
+          $('manualCode').value = '';
+          $('manualCode').classList.remove('ring-2', 'ring-rose-400');
+          hint.textContent = '验证码已提交，注册流程继续…（下一个邮箱到验证码环节会再次提示）';
+          hint.className = 'text-[11px] font-mono min-h-[1rem] text-leaf-600';
+        }
+      } catch (e) {
+        hint.textContent = '提交失败: ' + (e.message || e);
+        hint.className = 'text-[11px] font-mono min-h-[1rem] text-rose-500';
+      }
+    }
+
     /* ---------- Events ---------- */
     $('startForm').addEventListener('submit', async (ev) => {
       ev.preventDefault();
@@ -1666,9 +1876,35 @@
         setMessage($('formMessage'), '任务已在运行或启动中', false);
         return;
       }
+      const mailSrc = document.querySelector('input[name="mailSrc"]:checked');
+      let manualEmails = [];
+      if (mailSrc && mailSrc.value === 'manual') {
+        const raw = ($('manualEmail') ? $('manualEmail').value : '').trim();
+        manualEmails = raw.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
+        if (!manualEmails.length) {
+          setMessage($('formMessage'), '手动模式请先粘贴至少一个邮箱（每行一个）', false);
+          return;
+        }
+        // 验证码不必现在填：启动后各邮箱到「等待验证码」环节再粘贴提交
+        const code = ($('manualCode') ? $('manualCode').value : '').trim();
+        if (code) {
+          try {
+            const data = await fetchJSON('/api/manual-code', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ code }),
+            });
+            if (!data.ok) throw new Error(data.error || '提交失败');
+            $('manualCode').value = '';
+          } catch (e) {
+            setMessage($('formMessage'), '验证码提交失败: ' + (e.message || e), false);
+            return;
+          }
+        }
+      }
       let workers = Number($('workers').value || 4);
       let target = Number($('targetCustom').value || $('target').value || 100);
-      let mode = ($('registerMode') && $('registerMode').value) || 'same_session';
+      let mode = ($('registerMode') && $('registerMode').value) || 'protocol';
       state.starting = true;
       $('btnStart').disabled = true;
       setMessage($('formMessage'), '正在启动...', true);
@@ -1676,7 +1912,12 @@
         const data = await fetchJSON('/api/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ workers, target, mode }),
+          body: JSON.stringify({
+            workers,
+            target,
+            mode,
+            manual_emails: manualEmails.length ? manualEmails : undefined,
+          }),
         });
         setMessage($('formMessage'), data.message || '已启动', true);
         renderStatus(data);
@@ -2004,7 +2245,16 @@
       $('btnImportAll').addEventListener('click', () => importToUpstream(null));
     }
     if ($('successList')) {
-      $('successList').addEventListener('click', (ev) => {
+      $('successList').addEventListener('click', async (ev) => {
+        const copyBtn = ev.target.closest('.btn-copy-sso');
+        if (copyBtn && !copyBtn.disabled) {
+          const okBtn = copyBtn;
+          const ok = await copyText(okBtn.getAttribute('data-sso') || '');
+          const old = okBtn.textContent;
+          okBtn.textContent = ok ? '已复制' : '复制失败';
+          setTimeout(() => (okBtn.textContent = old), 1200);
+          return;
+        }
         const btn = ev.target.closest('.btn-import-one');
         if (!btn || btn.disabled) return;
         const id = btn.getAttribute('data-id');
@@ -2022,6 +2272,11 @@
 
     $('btnReloadConfig').addEventListener('click', loadConfig);
     $('btnRefreshKeys').addEventListener('click', refreshKeys);
+    if ($('btnGrokTest')) $('btnGrokTest').addEventListener('click', runGrokTest);
+    if ($('btnSubmitManualCode')) $('btnSubmitManualCode').addEventListener('click', submitManualCode);
+    document.querySelectorAll('input[name="mailSrc"]').forEach(r => {
+      r.addEventListener('change', () => toggleMailSrc(r.value));
+    });
     $('btnFetchDomains').addEventListener('click', () => fetchMailDomains(false));
 
     $('btnSolverStart').addEventListener('click', async () => {

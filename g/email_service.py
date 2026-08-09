@@ -11,6 +11,7 @@ from typing import Optional
 
 import requests
 from dotenv import load_dotenv
+from pathlib import Path
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -36,15 +37,35 @@ class EmailService:
     # 多域名轮换：跨实例共享下标，建邮时 round-robin
     _domain_rr_lock = threading.Lock()
     _domain_rr_idx = 0
+    # 手动邮箱队列消费锁（多 worker 线程并发安全）
+    _MANUAL_QUEUE_LOCK = threading.Lock()
 
     def __init__(self):
         load_dotenv(override=True)
         self.worker_domain = self.normalize_domain(os.getenv("WORKER_DOMAIN") or "")
         self.freemail_token = (os.getenv("FREEMAIL_TOKEN") or "").strip()
         self.mail_domain = (os.getenv("FREEMAIL_DOMAIN") or "").strip()  # 邮箱后缀，如 example.com 或 a.com,b.com
-        if not self.worker_domain:
-            raise ValueError("Missing: WORKER_DOMAIN")
-        self.base_url = f"https://{self.worker_domain}"
+        # 手动模式：不依赖 Worker。MANUAL_EMAIL 提供邮箱；
+        # 多邮箱：logs/manual_emails.txt（每行一个，按序消费，每封用一次）。
+        # 验证码：按邮箱独立文件 logs/manual_codes/<邮箱>.txt，或全局 manual_code.txt。
+        self.manual_email = (os.getenv("MANUAL_EMAIL") or "").strip()
+        self.manual_code = (os.getenv("MANUAL_CODE") or "").strip()
+        self._manual_code_used = False
+        self.manual_code_file = Path(
+            os.getenv("MANUAL_CODE_FILE")
+            or (Path(__file__).resolve().parents[1] / "logs" / "manual_code.txt")
+        )
+        self.manual_queue_file = Path(
+            os.getenv("MANUAL_EMAILS_FILE")
+            or (Path(__file__).resolve().parents[1] / "logs" / "manual_emails.txt")
+        )
+        self.manual_code_dir = Path(
+            os.getenv("MANUAL_CODE_DIR")
+            or (Path(__file__).resolve().parents[1] / "logs" / "manual_codes")
+        )
+        if not self.worker_domain and not self.manual_email:
+            raise ValueError("Missing: WORKER_DOMAIN（或设置 MANUAL_EMAIL 用手动模式）")
+        self.base_url = f"https://{self.worker_domain}" if self.worker_domain else ""
         self._jwt_by_email: dict[str, str] = {}
         self._session = self._build_session()
         # 探测 API 风格：cf_temp | freemail
@@ -192,8 +213,56 @@ class EmailService:
     def _random_name(self, n: int = 10) -> str:
         return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
+    def _next_manual_email(self) -> str:
+        """从队列文件取下一个邮箱（消费即删，返回后不再重复使用）。"""
+        email = self.manual_email
+        with self._MANUAL_QUEUE_LOCK:
+            try:
+                if self.manual_queue_file.exists():
+                    lines = [
+                        ln.strip()
+                        for ln in self.manual_queue_file.read_text(
+                            encoding="utf-8", errors="ignore"
+                        ).splitlines()
+                        if ln.strip()
+                    ]
+                    if lines:
+                        email = lines.pop(0)
+                        self.manual_queue_file.write_text(
+                            "\n".join(lines) + ("\n" if lines else ""),
+                            encoding="utf-8",
+                        )
+            except Exception:
+                pass
+        return email
+
+    @staticmethod
+    def _code_file_for(email: str) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9._@-]", "_", email or "")
+        return Path(
+            os.getenv("MANUAL_CODE_DIR")
+            or (Path(__file__).resolve().parents[1] / "logs" / "manual_codes")
+        ) / f"{safe}.txt"
+
+    @staticmethod
+    def _read_and_clear(path: Path) -> Optional[str]:
+        try:
+            if not path.exists():
+                return None
+            raw = path.read_text(encoding="utf-8", errors="ignore").strip()
+            if not raw:
+                return None
+            path.write_text("", encoding="utf-8")
+            return raw
+        except Exception:
+            return None
+
     def create_email(self):
         """创建临时邮箱，返回 (jwt, email)"""
+        if self.manual_email:
+            email = self._next_manual_email()
+            print(f"[manual] 使用手动邮箱: {email}（跳过 Worker）")
+            return email, email
         style = self._api_style
         if style in ("auto", "cf_temp", "cloudflare"):
             result = self._create_cf_temp()
@@ -301,7 +370,51 @@ class EmailService:
         否则容易把邮件 ID、时间戳等 6 位数字误当成验证码。
 
         轮询策略：前几次快扫（0.4s），后面稳定在 0.7s，总窗口约 30s+。
+
+        手动模式（MANUAL_EMAIL）：优先 MANUAL_CODE 环境变量（只消费一次）；
+        否则轮询 logs/manual_code.txt，写入内容即被读取并清空。
         """
+        if self.manual_email:
+            if not self._manual_code_used and self.manual_code:
+                self._manual_code_used = True
+                code = self._normalize_code(self.manual_code)
+                print(f"[manual] MANUAL_CODE 验证码: {code}")
+                return code
+            # 邮箱独立文件优先（页面/脚本按邮箱提交）；旧版全局文件兜底（只消费一次）
+            def _poll() -> Optional[str]:
+                raw = self._read_and_clear(self._code_file_for(email))
+                if raw:
+                    return self._normalize_code(raw)
+                if not self._manual_code_used:
+                    raw = self._read_and_clear(self.manual_code_file)
+                    if raw:
+                        self._manual_code_used = True
+                        return self._normalize_code(raw)
+                return None
+
+            code = _poll()
+            if code:
+                print(f"[manual] 收到 {email} 的验证码: {code}")
+                return code
+            print(
+                "[manual] 等待验证码: 请把收到的码通过页面「提交验证码」提交"
+                f"（或写入 {self._code_file_for(email)}，或设置 MANUAL_CODE）…"
+            )
+            deadline = time.time() + float(os.getenv("MANUAL_CODE_TIMEOUT") or 600)
+            while time.time() < deadline:
+                if stop_event is not None and stop_event.is_set():
+                    return None
+                code = _poll()
+                if code:
+                    print(f"[manual] 收到 {email} 的验证码: {code}")
+                    return code
+                if stop_event is not None:
+                    if stop_event.wait(3.0):
+                        return None
+                else:
+                    time.sleep(3.0)
+            return None
+
         jwt = self._jwt_by_email.get(email) or self.freemail_token
         seen_ids: set[str] = set()
         for attempt in range(max_attempts):
@@ -561,6 +674,9 @@ class EmailService:
 
     def delete_email(self, address):
         """删除邮箱"""
+        if self.manual_email:
+            print(f"[manual] 手动模式跳过删邮: {address}")
+            return
         jwt = self._jwt_by_email.get(address) or self.freemail_token
         try:
             # cloudflare_temp_email

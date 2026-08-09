@@ -1890,6 +1890,13 @@ def status():
 @app.get("/api/config")
 def get_config():
     cfg = read_env_file()
+    manual_email = os.getenv("MANUAL_EMAIL", "")
+    if not manual_email and ENV_PATH.exists():
+        for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+            raw = line.strip()
+            if raw.startswith("MANUAL_EMAIL="):
+                manual_email = raw.split("=", 1)[1].strip().strip('"').strip("'")
+                break
     return jsonify({
         "ok": True,
         "config": {
@@ -1907,6 +1914,7 @@ def get_config():
             "UI_HOST": cfg.get("UI_HOST", DEFAULTS["UI_HOST"]),
             "UI_PORT": cfg.get("UI_PORT", DEFAULTS["UI_PORT"]),
             "GROK_PROXY": cfg.get("GROK_PROXY", DEFAULTS.get("GROK_PROXY", "")),
+            "MANUAL_EMAIL": manual_email,
             # 前端 textarea 用换行；.env 内部是分号
             "GROK_PROXY_LIST": _normalize_proxy_list_text(
                 cfg.get("GROK_PROXY_LIST", DEFAULTS.get("GROK_PROXY_LIST", ""))
@@ -2124,6 +2132,11 @@ def save_config():
     sub2api_url = normalize_upstream_url(sub2api_url) or DEFAULTS["SUB2API_URL"]
     upstream_url = sub2api_url
 
+    # 手动邮箱模式（MANUAL_EMAIL）：前端显式传才更新；不传保留旧值
+    manual_email = ""
+    if "manual_email" in body:
+        manual_email = str(body.get("manual_email") or "").strip()
+
     if not re.fullmatch(r"\d{2,5}", ui_port):
         return jsonify({"ok": False, "message": "UI_PORT 必须是 2-5 位数字"}), 400
     if not re.fullmatch(r"\d{2,5}", solver_port):
@@ -2173,7 +2186,11 @@ def save_config():
         "UPSTREAM_URL": upstream_url,
         "UPSTREAM_ADMIN_EMAIL": upstream_email,
         "UPSTREAM_ADMIN_PASSWORD": upstream_pwd,
+        "MANUAL_EMAIL": manual_email,
     }
+    # 手动邮箱只在「运行」页显式传时才更新，配置页保存不覆盖
+    if "manual_email" not in body:
+        values.pop("MANUAL_EMAIL", None)
     try:
         write_env_file(values)
         apply_env_to_process(values)
@@ -2308,6 +2325,7 @@ def start():
     workers = body.get("workers", 8)
     target = body.get("target", 100)
     mode_raw = body.get("mode") or body.get("register_mode") or ""
+    manual_email = str(body.get("manual_email") or "").strip()
     try:
         workers = int(workers)
         target = int(target)
@@ -2327,12 +2345,38 @@ def start():
     except Exception:
         reg_mode = (mode_raw or "same_session").strip().lower() or "same_session"
 
-    env = env_snapshot()
-    if not env["worker_domain_set"] or not env["freemail_token_set"]:
-        return jsonify({
-            "ok": False,
-            "message": "请先在「配置」中填写 WORKER_DOMAIN 与 FREEMAIL_TOKEN",
-        }), 400
+    # 手动模式（manual_emails 多邮箱列表）：不要求 Worker/Token；按粘贴邮箱数量执行；
+    # Turnstile 仍由本地 Solver 自动解
+    manual_emails_raw = body.get("manual_emails")
+    if isinstance(manual_emails_raw, list):
+        manual_emails = [str(x).strip() for x in manual_emails_raw if str(x).strip()]
+    else:
+        manual_emails = [manual_email] if manual_email else []
+    manual_mode = bool(manual_emails)
+    if manual_mode:
+        try:
+            (BASE_DIR / "logs").mkdir(parents=True, exist_ok=True)
+            (BASE_DIR / "logs" / "manual_emails.txt").write_text(
+                "\n".join(manual_emails) + "\n", encoding="utf-8"
+            )
+            write_env_file({"MANUAL_EMAIL": manual_emails[0]})
+            apply_env_to_process({"MANUAL_EMAIL": manual_emails[0]})
+        except Exception as e:
+            logs.emit(f"手动邮箱写入失败: {e}", "warn")
+        workers = max(1, min(len(manual_emails), 8))
+        target = len(manual_emails)
+        logs.emit(
+            f"手动模式：{len(manual_emails)} 个邮箱，按粘贴数量执行"
+            f"（并发 {workers}，Worker/Token 无需配置）",
+            "info",
+        )
+    else:
+        env = env_snapshot()
+        if not env["worker_domain_set"] or not env["freemail_token_set"]:
+            return jsonify({
+                "ok": False,
+                "message": "请先在「配置」中填写 WORKER_DOMAIN 与 FREEMAIL_TOKEN",
+            }), 400
 
     # 本地 Solver 模式：开任务前自动确保 5072 在线（注册机与 Solver 是两个进程）
     cfg_env = read_env_file()
@@ -2436,410 +2480,160 @@ def clear_logs():
     return jsonify({"ok": True})
 
 
-@app.get("/api/keys")
-def list_keys():
-    keys_dir = BASE_DIR / "keys"
-    if not keys_dir.exists():
-        return jsonify({"files": []})
-    files = []
-    for p in sorted(keys_dir.glob("*.txt"), key=lambda x: x.stat().st_mtime, reverse=True):
-        try:
-            lines = sum(1 for _ in open(p, "r", encoding="utf-8", errors="ignore") if _.strip())
-        except Exception:
-            lines = 0
-        files.append({
-            "name": p.name,
-            "path": str(p.relative_to(BASE_DIR)).replace("\\", "/"),
-            "size": p.stat().st_size,
-            "count": lines,
-            "mtime": p.stat().st_mtime,
-        })
-    return jsonify({"files": files[:30]})
+@app.post("/api/grok-test")
+def api_grok_test():
+    """Grok 4.5 功能测试：粘贴 SSO →（可选 device flow 换 token）→ grok -p 测试。
 
-
-def _short_proxy_err(err: str, max_len: int = 96) -> str:
-    """把 curl 长错误压成一行可读短句。"""
-    s = str(err or "").strip()
-    if not s:
-        return "未知错误"
-    low = s.lower()
-    # curl (28) 超时
-    if "curl: (28)" in low or "timed out" in low or "timeout" in low:
-        m = re.search(r"after\s+(\d+)\s*milliseconds", s, re.I)
-        if m:
-            return f"连接超时（{m.group(1)}ms）"
-        return "连接超时"
-    if "curl: (7)" in low or "couldn't connect" in low or "connection refused" in low:
-        return "无法连接代理（拒绝/未监听）"
-    if "curl: (35)" in low or "ssl" in low or "tls" in low:
-        return "TLS/SSL 握手失败"
-    if "curl: (56)" in low or "recv failure" in low:
-        return "代理中断连接"
-    if "curl: (97)" in low or "socks" in low:
-        return "SOCKS 握手失败（协议/鉴权？）"
-    # 去掉 See https://… 长尾巴
-    s = re.split(r"\s+See https?://", s, maxsplit=1)[0]
-    s = re.sub(r"\s+", " ", s).strip()
-    # Failed to perform, curl: (N) …
-    m = re.search(r"curl:\s*\((\d+)\)\s*(.+)$", s, re.I)
-    if m:
-        s = f"curl({m.group(1)}) {m.group(2).strip()}"
-    if len(s) > max_len:
-        s = s[: max_len - 1] + "…"
-    return s
-
-
-def _curl_get(creq, url: str, proxies=None, timeout: float = 8.0, *, allow_redirects: bool = True):
-    kw = {
-        "timeout": timeout,
-        "impersonate": "chrome124",
-        "allow_redirects": allow_redirects,
-    }
-    if proxies:
-        kw["proxies"] = proxies
-    return creq.get(url, **kw)
-
-
-def _probe_egress_via_proxy(creq, proxies=None, timeout: float = 8.0) -> dict:
+    body: {sso, sso_rw?, exchange=True, message="hi", model="grok-4.5"}
     """
-    先测出口：IP + 国家/城市。
-    主源 mayips.com；失败再 ip-api / Cloudflare / ipify(+mayips 补地区)。
-    """
-    import time as _time
     import json as _json
-
-    t0 = _time.time()
-    out: dict = {
-        "ok": False,
-        "ip": "",
-        "cc": "",
-        "country": "",
-        "city": "",
-        "region": "",
-        "timezone": "",
-        "postal": "",
-        "asn": "",
-        "at": "",
-        "source": "",
-        "ms": 0,
-        "error": "",
-    }
-    # 单源别拖太久，串行失败时别堆到 30s+
-    to = max(3.0, min(10.0, float(timeout or 8.0)))
-    per = min(to, 6.0)
-    errors: list[str] = []
-
-    def _finish(src: str, **fields) -> dict:
-        out.update(fields)
-        out["ok"] = True
-        out["source"] = src
-        out["ms"] = round((_time.time() - t0) * 1000)
-        return out
-
-    def _parse_mayips(text: str) -> dict | None:
-        try:
-            data = _json.loads((text or "").strip() or "{}")
-        except Exception:
-            return None
-        if not isinstance(data, dict):
-            return None
-        ip = str(data.get("ip") or "").strip()
-        if not ip:
-            return None
-        cc = str(data.get("country") or "").strip().upper()
-        return {
-            "ip": ip,
-            "cc": cc[:2] if cc else "",
-            "country": cc,
-            "city": str(data.get("city") or "").strip(),
-            "region": str(data.get("state") or "").strip(),
-            "postal": str(data.get("postal") or "").strip(),
-            "asn": str(data.get("asn") or "").strip(),
-            "at": str(data.get("at") or "").strip(),
-        }
-
-    def _enrich_geo_with_mayips(ip: str) -> dict | None:
-        """只有裸 IP 时，用 mayips ?ip= 补国家/城市（仍走同一代理）。"""
-        ip = (ip or "").strip()
-        if not ip:
-            return None
-        try:
-            r = _curl_get(
-                creq,
-                f"https://mayips.com/?ip={ip}",
-                proxies=proxies,
-                timeout=per,
-            )
-            return _parse_mayips(r.text or "")
-        except Exception:
-            return None
-
-    # 1) mayips.com（主源：IP + 地区）
-    try:
-        r = _curl_get(creq, "https://mayips.com/", proxies=proxies, timeout=per)
-        parsed = _parse_mayips(r.text or "")
-        if parsed:
-            return _finish("mayips", **parsed)
-        errors.append(f"mayips:http_{getattr(r, 'status_code', 0)}")
-    except Exception as e:
-        errors.append(f"mayips:{type(e).__name__}:{_short_proxy_err(str(e), 48)}")
-
-    # 2) ip-api.com
-    try:
-        r = _curl_get(
-            creq,
-            "http://ip-api.com/json/?fields=status,message,country,countryCode,regionName,city,timezone,query,as",
-            proxies=proxies,
-            timeout=per,
-        )
-        data = _json.loads((r.text or "").strip() or "{}")
-        if str(data.get("status") or "").lower() == "success":
-            return _finish(
-                "ip-api",
-                ip=str(data.get("query") or "").strip(),
-                cc=str(data.get("countryCode") or "").upper(),
-                country=str(data.get("country") or "").strip(),
-                city=str(data.get("city") or "").strip(),
-                region=str(data.get("regionName") or "").strip(),
-                timezone=str(data.get("timezone") or "").strip(),
-                asn=str(data.get("as") or "").strip(),
-            )
-        errors.append(f"ip-api:{data.get('message') or r.status_code}")
-    except Exception as e:
-        errors.append(f"ip-api:{type(e).__name__}:{_short_proxy_err(str(e), 48)}")
-
-    # 3) Cloudflare trace（IP + 国家码）
-    bare_ip = ""
-    try:
-        r = _curl_get(
-            creq,
-            "https://www.cloudflare.com/cdn-cgi/trace",
-            proxies=proxies,
-            timeout=per,
-        )
-        kv = {}
-        for line in (r.text or "").splitlines():
-            if "=" in line:
-                k, v = line.split("=", 1)
-                kv[k.strip()] = v.strip()
-        bare_ip = str(kv.get("ip") or "").strip()
-        loc = str(kv.get("loc") or "").strip().upper()
-        if bare_ip:
-            # 有 loc 先用；再尝试 mayips 补城市
-            extra = _enrich_geo_with_mayips(bare_ip) or {}
-            return _finish(
-                "cloudflare+mayips" if extra.get("city") or extra.get("cc") else "cloudflare",
-                ip=bare_ip,
-                cc=(extra.get("cc") or (loc[:2] if loc else "")),
-                country=extra.get("country") or loc,
-                city=extra.get("city") or "",
-                region=extra.get("region") or "",
-                postal=extra.get("postal") or "",
-                asn=extra.get("asn") or "",
-                at=extra.get("at") or "",
-            )
-        errors.append(f"cf:{r.status_code}")
-    except Exception as e:
-        errors.append(f"cf:{type(e).__name__}:{_short_proxy_err(str(e), 48)}")
-
-    # 4) ipify 裸 IP → mayips 补地区
-    try:
-        r = _curl_get(creq, "https://api.ipify.org", proxies=proxies, timeout=min(per, 5.0))
-        bare_ip = (r.text or "").strip()
-        if r.status_code == 200 and bare_ip and len(bare_ip) < 64:
-            extra = _enrich_geo_with_mayips(bare_ip) or {}
-            if extra:
-                return _finish("ipify+mayips", **extra)
-            return _finish("ipify", ip=bare_ip)
-        errors.append(f"ipify:http_{r.status_code}")
-    except Exception as e:
-        errors.append(f"ipify:{type(e).__name__}:{_short_proxy_err(str(e), 48)}")
-
-    out["ms"] = round((_time.time() - t0) * 1000)
-    out["error"] = _short_proxy_err(" | ".join(errors) if errors else "出口探测失败")
-    return out
-
-
-def _format_egress_label(eg: dict) -> str:
-    """出口一行：1.2.3.4 · HK Kwai Chung · Kwai Tsing District · AS48266"""
-    if not eg or not eg.get("ok"):
-        return ""
-    ip = str(eg.get("ip") or "").strip()
-    cc = str(eg.get("cc") or eg.get("country") or "").strip().upper()
-    city = str(eg.get("city") or "").strip()
-    region = str(eg.get("region") or "").strip()
-    asn = str(eg.get("asn") or "").strip()
-    at = str(eg.get("at") or "").strip()
-    tz = str(eg.get("timezone") or "").strip()
-    parts = []
-    if ip:
-        parts.append(ip)
-    # 国家 + 城市
-    geo_bits = [x for x in (cc, city) if x]
-    if geo_bits:
-        parts.append(" ".join(geo_bits))
-    # 州/区（与城市不同才显示）
-    if region and region.lower() not in (city or "").lower():
-        parts.append(region)
-    if asn:
-        parts.append(asn)
-    if at and at.lower() not in ("", "isp"):
-        parts.append(at)
-    if tz:
-        parts.append(tz)
-    return " · ".join(parts)
-
-
-def _probe_register_proxy(raw: str, timeout: float = 12.0) -> dict:
-    """
-    测试注册代理，两步：
-      1) 出口 IP / 区域（ip-api 等）
-      2) accounts.x.ai 连通性
-    raw 空 = 直连探测。
-    """
+    import os as _os
+    import shutil as _shutil
+    import subprocess as _subprocess
+    import sys as _sys
     import time as _time
 
-    raw = (raw or "").strip()
-    t0 = _time.time()
-    result: dict = {
-        "ok": False,
-        "proxy": raw or "(direct)",
-        "mode": "proxy" if raw else "direct",
-        "ms": 0,
-        "via": "",
-        "status": 0,
-        "egress_ok": False,
-        "egress_ip": "",
-        "egress_cc": "",
-        "egress_country": "",
-        "egress_city": "",
-        "egress_region": "",
-        "egress_timezone": "",
-        "egress_label": "",
-        "egress_ms": 0,
-        "xai_ok": False,
-        "xai_status": 0,
-        "xai_ms": 0,
-        "message": "",
-        "error": "",
-    }
-    try:
-        from g.same_session_register import parse_proxy_spec
-    except Exception as e:
-        result["error"] = f"parse_proxy_spec 不可用: {e}"
-        result["message"] = result["error"]
-        result["ms"] = round((_time.time() - t0) * 1000)
-        return result
+    from test_grok45 import GROK, AUTH_FILE, BACKUP, build_auth  # noqa: E402
 
-    proxies = None
-    server_show = "(direct)"
-    if raw:
-        parsed = parse_proxy_spec(raw)
-        if not parsed:
-            result["error"] = "代理格式无法解析"
-            result["message"] = (
-                "格式错误。支持 host:port · http/socks5:// · "
-                "user:pass@host:port · host:port:user:pass"
+    body = request.get_json(silent=True) or {}
+    raw = str(body.get("sso") or "").strip()
+    sso_rw = str(body.get("sso_rw") or "").strip()
+    exchange = bool(body.get("exchange", True))
+    message_text = str(body.get("message") or "").strip() or "hi"
+    model = str(body.get("model") or "").strip() or "grok-4.5"
+    if not raw:
+        return jsonify({"ok": False, "error": "未提供 SSO（先在成功列表点「复制」）"})
+    if "----" in raw:
+        parts = raw.split("----")
+        if len(parts) >= 2:
+            if not sso_rw and len(parts) >= 3:
+                sso_rw = parts[2].strip()
+            raw = parts[1].strip()
+
+    tok = {}
+    if exchange:
+        try:
+            ws = r"D:\workspace\34"
+            if ws not in _sys.path:
+                _sys.path.insert(0, ws)
+            from device_flow import device_flow_to_token  # noqa: E402
+
+            flow = device_flow_to_token(raw, issue_token=True)
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"device flow 换 token 异常: {e}"})
+        if not flow.get("ok") or not flow.get("token"):
+            return jsonify(
+                {"ok": False, "error": f"换 token 失败: {flow.get('error') or '未知'}"}
             )
-            result["ms"] = round((_time.time() - t0) * 1000)
-            return result
-        url = (parsed.get("server_url") or parsed.get("server") or "").strip()
-        if not url:
-            result["error"] = "解析结果无 server"
-            result["message"] = result["error"]
-            result["ms"] = round((_time.time() - t0) * 1000)
-            return result
-        proxies = {"http": url, "https": url}
-        # 展示时打码密码
-        server_show = str(parsed.get("server") or url)
-        if parsed.get("username"):
-            u = str(parsed.get("username") or "")
-            u_show = u if len(u) <= 24 else (u[:12] + "…" + u[-8:])
-            server_show = f"{parsed.get('scheme') or 'http'}://{u_show}:***@" + server_show.split("://", 1)[-1]
-        result["proxy"] = server_show
-        result["scheme"] = parsed.get("scheme") or ""
+        tok = dict(flow["token"])
+        tok.setdefault("email", str(body.get("email") or ""))
+    else:
+        return jsonify({
+            "ok": False,
+            "error": "关闭「自动换取 token」时需直接提供 access_token（当前面板只支持 SSO 输入，请保持开关开启）",
+        })
 
     try:
-        from curl_cffi import requests as creq
+        auth = build_auth(tok)
     except Exception as e:
-        result["error"] = f"curl_cffi 不可用: {e}"
-        result["message"] = result["error"]
-        result["ms"] = round((_time.time() - t0) * 1000)
-        return result
+        return jsonify({"ok": False, "error": f"转换 auth 失败: {e}"})
 
-    to = max(3.0, min(30.0, float(timeout or 12.0)))
-    mode = "代理" if raw else "直连"
+    account = ""
+    for _v in auth.values():
+        if isinstance(_v, dict):
+            account = (
+                _v.get("email")
+                or str(body.get("email") or "").strip()
+                or (_v.get("principal_id") or _v.get("user_id") or "")[:12]
+                or ""
+            )
+            break
+    if not account:
+        account = "(未知)"
 
-    # ── ① 先测出口 IP / 区域（主源 mayips.com）──
-    eg = _probe_egress_via_proxy(creq, proxies=proxies, timeout=min(to, 8.0))
-    result["egress_ok"] = bool(eg.get("ok"))
-    result["egress_ip"] = str(eg.get("ip") or "")
-    result["egress_cc"] = str(eg.get("cc") or "")
-    result["egress_country"] = str(eg.get("country") or "")
-    result["egress_city"] = str(eg.get("city") or "")
-    result["egress_region"] = str(eg.get("region") or "")
-    result["egress_timezone"] = str(eg.get("timezone") or "")
-    result["egress_postal"] = str(eg.get("postal") or "")
-    result["egress_asn"] = str(eg.get("asn") or "")
-    result["egress_at"] = str(eg.get("at") or "")
-    result["egress_source"] = str(eg.get("source") or "")
-    result["egress_ms"] = int(eg.get("ms") or 0)
-    result["egress_label"] = _format_egress_label(eg)
-    if not eg.get("ok"):
-        result["egress_error"] = str(eg.get("error") or "出口探测失败")
-
-    # ── ② 再测 x.ai 连通性 ──
-    xai_err = ""
-    xai_t0 = _time.time()
+    tmp = _os.path.join(_os.environ.get("TEMP", "."), "grok_web_test_auth.json")
     try:
-        r = _curl_get(
-            creq,
-            "https://accounts.x.ai/sign-up",
-            proxies=proxies,
-            timeout=to,
-            allow_redirects=True,
-        )
-        status = int(getattr(r, "status_code", 0) or 0)
-        result["status"] = status
-        result["xai_status"] = status
-        result["xai_ms"] = round((_time.time() - xai_t0) * 1000)
-        result["via"] = "accounts.x.ai"
-        if status and status < 500:
-            result["xai_ok"] = True
-            result["ok"] = True
+        with open(tmp, "w", encoding="utf-8") as f:
+            _json.dump(auth, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"写临时 auth 失败: {e}"})
+
+    had_old = _os.path.isfile(AUTH_FILE)
+    if had_old:
+        _shutil.copy2(AUTH_FILE, BACKUP)
+
+    def _run_grok(args, timeout_s: int):
+        try:
+            r = _subprocess.run(
+                [GROK, *args],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_s,
+            )
+            return (r.stdout or "") + (r.stderr or ""), r.returncode
+        except _subprocess.TimeoutExpired:
+            return "", -9
+
+    try:
+        _shutil.copy2(tmp, AUTH_FILE)
+        t0 = _time.time()
+        models_out, _ = _run_grok(["models"], 60)
+        reply_out, rc = _run_grok(["-p", message_text, "-m", model], 120)
+        elapsed_s = round(_time.time() - t0, 1)
+        ok = rc == 0 and bool((reply_out or "").strip())
+        return jsonify({
+            "ok": ok,
+            "exit_code": rc,
+            "elapsed_s": elapsed_s,
+            "exchanged": exchange,
+            "account": account,
+            "models": models_out.strip()[:400],
+            "reply": reply_out.strip()[-6000:],
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"测试执行失败: {e}"})
+    finally:
+        try:
+            if had_old:
+                _shutil.copy2(BACKUP, AUTH_FILE)
+        except Exception:
+            pass
+
+
+@app.post("/api/manual-code")
+def api_manual_code():
+    """手动模式：提交粘贴的验证码（写入 logs/manual_code.txt 供注册流程读取）；
+    附带 email 时同时保存 MANUAL_EMAIL。"""
+    body = request.get_json(silent=True) or {}
+    code = str(body.get("code") or "").strip()
+    email = str(body.get("email") or "").strip()
+    if not code:
+        return jsonify({"ok": False, "error": "验证码为空"})
+    try:
+        (BASE_DIR / "logs").mkdir(parents=True, exist_ok=True)
+        if email:
+            # 多邮箱手动模式：写入该邮箱独立通道，避免并发抢码
+            safe = re.sub(r"[^A-Za-z0-9._@-]", "_", email)
+            cdir = BASE_DIR / "logs" / "manual_codes"
+            cdir.mkdir(parents=True, exist_ok=True)
+            (cdir / f"{safe}.txt").write_text(code, encoding="utf-8")
         else:
-            xai_err = f"http_{status}"
+            (BASE_DIR / "logs" / "manual_code.txt").write_text(code, encoding="utf-8")
     except Exception as e:
-        result["xai_ms"] = round((_time.time() - xai_t0) * 1000)
-        xai_err = f"{type(e).__name__}:{e}"
-
-    result["ms"] = round((_time.time() - t0) * 1000)
-
-    # 拼展示文案：出口 + xAI
-    eg_part = ""
-    if result.get("egress_ok") and result.get("egress_label"):
-        eg_part = f"出口 {result['egress_label']}"
-        if result.get("egress_ms"):
-            eg_part += f" ({result['egress_ms']}ms)"
-    elif result.get("egress_error"):
-        eg_part = f"出口失败 · {_short_proxy_err(result['egress_error'])}"
-    else:
-        eg_part = "出口未知"
-
-    if result.get("xai_ok"):
-        xai_part = f"xAI OK · HTTP {result.get('xai_status') or result.get('status')} · {result.get('xai_ms') or 0}ms"
-        result["message"] = f"{eg_part}  →  {xai_part}"
-        return result
-
-    short = _short_proxy_err(xai_err or "xAI 不通")
-    result["error"] = short
-    result["error_raw"] = str(xai_err)[:240]
-    result["via"] = "fail" if not result.get("via") else result["via"]
-    if result.get("egress_ok"):
-        result["message"] = f"{eg_part}  →  xAI 不通 · {short} · 总 {result['ms']}ms"
-    else:
-        result["message"] = f"{mode}失败 · {eg_part}  →  xAI · {short} · 总 {result['ms']}ms"
-    return result
+        return jsonify({"ok": False, "error": f"写入验证码失败: {e}"}), 500
+    msg = f"验证码已提交（{str(code)[:10]}…），等待注册流程读取"
+    if email:
+        msg = f"已写入邮箱 {email} 的通道；" + msg
+    if email:
+        try:
+            values = {"MANUAL_EMAIL": email}
+            write_env_file(values)
+            apply_env_to_process(values)
+        except Exception:
+            pass
+    return jsonify({"ok": True, "message": msg})
 
 
 @app.post("/api/proxy/validate")
