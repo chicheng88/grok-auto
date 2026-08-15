@@ -2993,6 +2993,40 @@ def _safe_keys_file(name: str) -> Path | None:
     return path
 
 
+@app.get("/api/keys")
+def list_key_files():
+    """List downloadable result files without exposing anything outside keys/."""
+    keys_dir = BASE_DIR / "keys"
+    if not keys_dir.is_dir():
+        return jsonify({"files": []})
+
+    files = []
+    for path in keys_dir.iterdir():
+        if not path.is_file() or path.suffix.lower() not in (".txt", ".csv"):
+            continue
+        is_credentials = path.name.lower().endswith("_credentials.csv")
+        if path.suffix.lower() == ".csv" and not is_credentials:
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            count = len([line for line in lines if line.strip()])
+            if is_credentials and lines and lines[0].strip().lower() == "email,password":
+                count -= 1
+            stat = path.stat()
+        except OSError:
+            continue
+        files.append({
+            "name": path.name,
+            "path": f"keys/{path.name}",
+            "size": stat.st_size,
+            "count": max(0, count),
+            "kind": "credentials" if is_credentials else "sso",
+            "modified": int(stat.st_mtime),
+        })
+    files.sort(key=lambda item: item["modified"], reverse=True)
+    return jsonify({"files": files})
+
+
 def _read_sso_file_lines(path: Path) -> list[str]:
     text = path.read_text(encoding="utf-8", errors="ignore")
     return [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
