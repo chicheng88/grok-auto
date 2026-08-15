@@ -1,4 +1,5 @@
 import base64
+import csv
 import json
 import os
 import random
@@ -1889,6 +1890,7 @@ class RegisterEngine:
         # 任务结束后冻结耗时，避免 get_status 继续 now-start 空转计时
         self.end_time: Optional[float] = None
         self.output_file: Optional[str] = None
+        self.credentials_file: Optional[str] = None
         self.status = "idle"  # idle | initializing | running | stopping | done | error
         self.error_message = ""
         # 默认同会话 CLEAN；可被 start(mode=) / GROK_REGISTER_MODE 覆盖
@@ -2094,6 +2096,7 @@ class RegisterEngine:
             "avg_seconds": round(avg, 1),
             "progress": round(progress, 1),
             "output_file": self.output_file or "",
+            "credentials_file": self.credentials_file or "",
             "action_id": self.config.get("action_id") or "",
             "site_key": self.config.get("site_key") or "",
             "error_message": self.error_message,
@@ -2418,6 +2421,34 @@ class RegisterEngine:
             self.log(f"{email} 紧急落盘失败: {e} | SSO 前缀 {s[:20]}…", "error")
         return ok
 
+    def _save_credentials(self, email: str, password: str) -> str:
+        """Persist login credentials separately from SSO-only import files."""
+        if not email or not password:
+            return ""
+        raw_path = self.credentials_file
+        if not raw_path:
+            if self.output_file:
+                output_path = Path(self.output_file)
+                raw_path = str(
+                    output_path.with_name(output_path.stem + "_credentials.csv")
+                )
+            else:
+                raw_path = str(_BASE_DIR / "keys" / "credentials.csv")
+            self.credentials_file = raw_path
+        path = Path(raw_path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_header = not path.exists() or path.stat().st_size == 0
+            with open(path, "a", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow(("email", "password"))
+                writer.writerow((email, password))
+            return str(path)
+        except Exception as exc:
+            self.log(f"{email} 登录凭据写入失败: {exc}", "error")
+            return ""
+
     def _record_success(
         self,
         email: str,
@@ -2426,17 +2457,19 @@ class RegisterEngine:
         email_service: Optional[EmailService] = None,
         note: str = "",
         *,
+        password: str = "",
         already_written: bool = False,
         auth_token: Optional[dict] = None,
     ) -> str:
         """
-        写入 SSO 并计入成功。返回 success_id（空串表示未计入成功列表）。
+        写入 SSO、登录凭据并计入成功。返回 success_id（空串表示未计入成功列表）。
         same_session：停批看创邮次数，CLEAN 数可超过 target（在飞号收尾仍计成功）。
         protocol：仍按 CLEAN 数顶 target。
         already_written=True：SSO 已在紧急落盘写过，只更新计数/UI，避免重复行。
         auth_token：注册时 device flow 换到的 token，导入上游可直写，免二次换票。
         """
         with self.file_lock:
+            credentials_path = self._save_credentials(email, password)
             mode_now = resolve_register_mode(getattr(self, "register_mode", None))
             # same_session 以创邮次数停批；在飞号拿到 CLEAN 仍应进成功列表
             # protocol 旧路径才用 success_count 顶 target
@@ -2504,6 +2537,8 @@ class RegisterEngine:
                 f"SSO: {sso[:15]}... | 平均: {avg:.1f}s | NSFW: {nsfw_tag}{extra}",
                 "success",
             )
+            if credentials_path:
+                self.log(f"{email} 登录凭据已保存: {credentials_path}", "info")
             if email_service is not None:
                 try:
                     email_service.delete_email(email)
@@ -3441,6 +3476,7 @@ class RegisterEngine:
                         f"mode=same_session castle={castle_len} "
                         f"method={castle_method} risk=CLEAN"
                     ),
+                    password=password,
                     already_written=False,
                     auth_token=None,
                 )
@@ -3872,6 +3908,7 @@ class RegisterEngine:
                             unhinged_ok=False,
                             email_service=email_service,
                             note="enrich=pending",
+                            password=password,
                             already_written=sso_saved,
                             auth_token=None,
                         )
@@ -4225,6 +4262,7 @@ class RegisterEngine:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             prefix = "grok_ss" if reg_mode == "same_session" else "grok"
             self.output_file = f"keys/{prefix}_{timestamp}_{target}.txt"
+            self.credentials_file = f"keys/{prefix}_{timestamp}_{target}_credentials.csv"
 
             if blocking:
                 self._run_workers(workers)
