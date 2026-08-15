@@ -953,6 +953,26 @@ PROXIES = {
 }
 
 
+def _configured_curl_proxies() -> dict[str, str]:
+    """Resolve the registration proxy for curl_cffi without using system proxy settings."""
+    if PROXIES:
+        return dict(PROXIES)
+
+    raw = (os.environ.get("GROK_PROXY") or os.environ.get("XAI_PROXY") or "").strip()
+    if not raw:
+        pool = (os.environ.get("GROK_PROXY_LIST") or "").strip()
+        raw = next((part.strip() for part in re.split(r"[\n,;]+", pool) if part.strip()), "")
+    if not raw:
+        return {}
+
+    try:
+        parsed = parse_proxy_spec(raw) or {}
+        url = str(parsed.get("server_url") or parsed.get("server") or "").strip()
+        return {"http": url, "https": url} if url else {}
+    except Exception:
+        return {}
+
+
 def generate_random_name() -> str:
     length = random.randint(4, 6)
     return random.choice(string.ascii_uppercase) + "".join(
@@ -1071,8 +1091,9 @@ def _wait_device_flow_cooldown() -> None:
 
 
 def _proxy_kw() -> dict:
-    """统一代理参数：显式 PROXIES 优先；否则不传，避免误绑死掉的系统代理。"""
-    return {"proxies": PROXIES} if PROXIES else {}
+    """Pass the configured registration proxy to curl_cffi, never ambient system proxies."""
+    proxies = _configured_curl_proxies()
+    return {"proxies": proxies} if proxies else {}
 
 
 def _extract_signup_action_id(js_or_html: str) -> Optional[str]:
@@ -3498,7 +3519,10 @@ class RegisterEngine:
         while not self.stop_event.is_set() and self.success_count < self.target_count:
             try:
                 impersonate_fingerprint, account_user_agent = get_random_chrome_profile()
-                with requests.Session(impersonate=impersonate_fingerprint, proxies=PROXIES) as session:
+                with requests.Session(
+                    impersonate=impersonate_fingerprint,
+                    proxies=_configured_curl_proxies(),
+                ) as session:
                     try:
                         session.get(self.site_url, timeout=8)
                     except Exception:

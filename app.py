@@ -6,6 +6,7 @@ Grok 注册机 Web 控制台
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -197,6 +198,9 @@ def write_env_file(values: dict) -> None:
             continue
         key = stripped.split("=", 1)[0].strip()
         if key in values:
+            if key in written:
+                # Keep one canonical entry when a prior partial save left duplicates.
+                continue
             out.append(f"{key}={values[key]}")
             written.add(key)
         else:
@@ -204,7 +208,7 @@ def write_env_file(values: dict) -> None:
 
     # append missing keys
     for key in CONFIG_KEYS:
-        if key not in written:
+        if key in values and key not in written:
             if out and out[-1].strip():
                 out.append("")
             out.append(f"{key}={values.get(key, DEFAULTS.get(key, ''))}")
@@ -294,6 +298,138 @@ def _primary_proxy_from_values(proxy_list: str, single: str) -> str:
     if lines:
         return lines[0]
     return (single or "").strip()
+
+
+def _proxy_display_name(raw: str, parsed: dict | None = None) -> str:
+    """Return a proxy label without ever sending credentials back to the UI."""
+    info = parsed or {}
+    server = str(info.get("server") or "").strip()
+    if server:
+        return server
+    # The fallback also covers a parser that accepts an unusual URL form.
+    return re.sub(r"//[^/@]+@", "//", (raw or "").strip())[:160]
+
+
+def _probe_register_proxy(raw: str, *, timeout: float = 12.0) -> dict:
+    """Check proxy egress and xAI reachability without leaking proxy credentials."""
+    raw = (raw or "").strip()
+    timeout = max(3.0, min(float(timeout or 12.0), 45.0))
+    started = time.monotonic()
+    result = {
+        "ok": False,
+        "proxy": "(direct)" if not raw else "",
+        "egress_ok": False,
+        "egress_ip": "",
+        "egress_label": "",
+        "egress_source": "",
+        "egress_ms": 0,
+        "egress_error": "",
+        "xai_ok": False,
+        "xai_status": 0,
+        "xai_ms": 0,
+        "error": "",
+        "message": "",
+        "ms": 0,
+    }
+
+    proxies = None
+    if raw:
+        try:
+            from g.same_session_register import parse_proxy_spec
+
+            parsed = parse_proxy_spec(raw)
+            if not parsed:
+                raise ValueError("代理格式无法解析")
+            proxy_url = str(parsed.get("server_url") or parsed.get("server") or "").strip()
+            if not proxy_url:
+                raise ValueError("代理地址为空")
+            result["proxy"] = _proxy_display_name(raw, parsed)
+            proxies = {"http": proxy_url, "https": proxy_url}
+        except Exception as exc:
+            message = str(exc) or "代理格式无法解析"
+            result.update({
+                "error": message[:180],
+                "message": f"代理配置无效：{message[:120]}",
+            })
+            result["ms"] = round((time.monotonic() - started) * 1000)
+            return result
+
+    try:
+        from curl_cffi import requests as http_requests
+    except Exception as exc:
+        message = f"curl_cffi 不可用：{exc}"
+        result.update({"error": message[:180], "message": message[:160]})
+        result["ms"] = round((time.monotonic() - started) * 1000)
+        return result
+
+    # IP geolocation services occasionally rate-limit. A plain IP endpoint is a
+    # deliberate fallback so an otherwise usable proxy is not reported as dead.
+    egress_started = time.monotonic()
+    egress_errors: list[str] = []
+    for url, source in (
+        ("https://ipapi.co/json/", "ipapi"),
+        ("https://api64.ipify.org?format=json", "ipify"),
+    ):
+        try:
+            response = http_requests.get(
+                url,
+                proxies=proxies,
+                timeout=timeout,
+                impersonate="chrome124",
+            )
+            status = int(getattr(response, "status_code", 0) or 0)
+            if not 200 <= status < 300:
+                raise RuntimeError(f"{source} HTTP {status}")
+            data = response.json()
+            ip = str(data.get("ip") or data.get("query") or "").strip()
+            if not ip:
+                raise RuntimeError(f"{source} 未返回出口 IP")
+            cc = str(data.get("country_code") or data.get("countryCode") or "").upper()
+            city = str(data.get("city") or "").strip()
+            country = str(data.get("country_name") or data.get("country") or "").strip()
+            label = " / ".join(x for x in (ip, cc, city or country) if x)
+            result.update({
+                "egress_ok": True,
+                "egress_ip": ip,
+                "egress_label": label or ip,
+                "egress_source": source,
+                "egress_ms": round((time.monotonic() - egress_started) * 1000),
+            })
+            break
+        except Exception as exc:
+            egress_errors.append(f"{source}: {str(exc)[:100]}")
+    if not result["egress_ok"]:
+        result["egress_ms"] = round((time.monotonic() - egress_started) * 1000)
+        result["egress_error"] = "; ".join(egress_errors)[:220]
+
+    xai_started = time.monotonic()
+    try:
+        response = http_requests.get(
+            "https://accounts.x.ai/",
+            proxies=proxies,
+            timeout=timeout,
+            impersonate="chrome124",
+            allow_redirects=True,
+        )
+        status = int(getattr(response, "status_code", 0) or 0)
+        result["xai_status"] = status
+        # Any HTTP response below 500 proves the proxy reached xAI. A 401/403 is
+        # meaningful application feedback, not a TCP/proxy failure.
+        result["xai_ok"] = 100 <= status < 500
+        if not result["xai_ok"]:
+            result["error"] = f"xAI HTTP {status}"
+    except Exception as exc:
+        result["error"] = f"xAI 请求失败：{str(exc)[:180]}"
+    result["xai_ms"] = round((time.monotonic() - xai_started) * 1000)
+    result["ms"] = round((time.monotonic() - started) * 1000)
+    result["ok"] = bool(result["xai_ok"])
+    if result["ok"]:
+        result["message"] = f"xAI 连通（HTTP {result['xai_status']}）"
+    elif result["egress_ok"]:
+        result["message"] = result["error"] or "出口可用，但 xAI 不可达"
+    else:
+        result["message"] = result["error"] or result["egress_error"] or "代理出口探测失败"
+    return result
 
 
 def _split_mail_domains(raw: str) -> list[str]:

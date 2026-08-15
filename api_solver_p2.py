@@ -8,6 +8,7 @@ import asyncio
 from typing import Optional, Union
 import argparse
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 # Windows 控制台 GBK 下避免 emoji / rich 编码崩溃
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
@@ -86,6 +87,8 @@ class TurnstileAPIServer:
         self.thread_count = thread
         self.proxy_support = proxy_support
         self.browser_pool = asyncio.Queue()
+        self._camoufox_instances = []
+        self.launch_proxy, self.launch_proxy_label = self._load_launch_proxy()
         self.use_random_config = use_random_config
         self.browser_name = browser_name
         self.browser_version = browser_version
@@ -122,6 +125,23 @@ class TurnstileAPIServer:
             self.browser_args.append(f"--user-agent={self.useragent}")
 
         self._setup_routes()
+
+    @staticmethod
+    def _load_launch_proxy():
+        """Read a browser-launch proxy without exposing credentials in logs."""
+        raw = (os.getenv("SOLVER_PROXY") or os.getenv("GROK_PROXY") or "").strip()
+        if not raw:
+            return None, "None"
+        normalized = raw if "://" in raw else f"http://{raw}"
+        parsed = urlparse(normalized)
+        if not parsed.scheme or not parsed.hostname or not parsed.port:
+            logger.warning("Ignoring invalid SOLVER_PROXY/GROK_PROXY value")
+            return None, "None"
+        proxy = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+        if parsed.username:
+            proxy["username"] = unquote(parsed.username)
+            proxy["password"] = unquote(parsed.password or "")
+        return proxy, proxy["server"]
 
     def display_welcome(self):
         """Displays welcome screen with logo."""
@@ -188,21 +208,12 @@ class TurnstileAPIServer:
     async def _initialize_browser(self) -> None:
         """Initialize the browser and create the page pool."""
         playwright = None
-        camoufox = None
+        camoufox_profile = None
 
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
             playwright = await async_playwright().start()
         elif self.browser_type == "camoufox":
-            camoufox = AsyncCamoufox(
-                headless=self.headless,
-                persistent_context=True,
-                user_data_dir=r"C:\Users\G\.camoufox_persist\grok_reg",
-                humanize=True,
-                os=("windows",),
-                locale="en-US",
-                block_webrtc=True,
-                block_webgl=False,
-            )
+            camoufox_profile = Path.home() / ".camoufox_persist" / "grok_reg"
 
         browser_configs = []
         for _ in range(self.thread_count):
@@ -237,31 +248,58 @@ class TurnstileAPIServer:
                 'sec_ch_ua': sec_ch_ua
             })
 
-        for i in range(self.thread_count):
-            config = browser_configs[i]
-            
-            browser_args = [
-                "--window-position=0,0",
-                "--force-device-scale-factor=1"
-            ]
-            if config['useragent']:
-                browser_args.append(f"--user-agent={config['useragent']}")
-            
-            browser = None
-            if self.browser_type in ['chromium', 'chrome', 'msedge'] and playwright:
-                browser = await playwright.chromium.launch(
-                    channel=self.browser_type,
-                    headless=self.headless,
-                    args=browser_args
-                )
-            elif self.browser_type == "camoufox" and camoufox:
-                browser = await camoufox.start()
-
-            if browser:
-                await self.browser_pool.put((i+1, browser, config))
-
+        if self.browser_type == "camoufox" and camoufox_profile:
+            # Camoufox persistent contexts cannot reliably start several browser
+            # processes on this host. One context can safely host several pages,
+            # so share it across the worker queue instead.
+            profile_dir = camoufox_profile.parent / f"{camoufox_profile.name}_solver"
             if self.debug:
-                logger.info(f"Browser {i + 1} initialized successfully with {config['browser_name']} {config['browser_version']}")
+                logger.info(
+                    f"Starting shared camoufox context with proxy: {self.launch_proxy_label}"
+                )
+            camoufox = AsyncCamoufox(
+                headless=self.headless,
+                persistent_context=True,
+                user_data_dir=str(profile_dir),
+                proxy=self.launch_proxy,
+                humanize=True,
+                os=("windows",),
+                locale="en-US",
+                block_webrtc=True,
+                block_webgl=False,
+            )
+            self._camoufox_instances.append(camoufox)
+            browser = await camoufox.start()
+            for i, config in enumerate(browser_configs):
+                await self.browser_pool.put((i + 1, browser, config))
+                if self.debug:
+                    logger.info(
+                        f"Browser worker {i + 1} initialized with shared camoufox context"
+                    )
+        else:
+            for i in range(self.thread_count):
+                config = browser_configs[i]
+            
+                browser_args = [
+                    "--window-position=0,0",
+                    "--force-device-scale-factor=1"
+                ]
+                if config['useragent']:
+                    browser_args.append(f"--user-agent={config['useragent']}")
+            
+                browser = None
+                if self.browser_type in ['chromium', 'chrome', 'msedge'] and playwright:
+                    browser = await playwright.chromium.launch(
+                        channel=self.browser_type,
+                        headless=self.headless,
+                        args=browser_args
+                    )
+
+                if browser:
+                    await self.browser_pool.put((i+1, browser, config))
+
+                if self.debug:
+                    logger.info(f"Browser {i + 1} initialized successfully with {config['browser_name']} {config['browser_version']}")
 
         logger.info(f"Browser pool initialized with {self.browser_pool.qsize()} browsers")
         
@@ -603,7 +641,7 @@ class TurnstileAPIServer:
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None):
         """Solve the Turnstile challenge."""
-        proxy = None
+        proxy = self.launch_proxy_label if self.launch_proxy else None
 
         index, browser, browser_config = await self.browser_pool.get()
         
